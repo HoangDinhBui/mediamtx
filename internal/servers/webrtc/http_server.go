@@ -76,7 +76,7 @@ type httpServer struct {
 	encryption     bool
 	serverKey      string
 	serverCert     string
-	allowOrigin    string
+	allowOrigins   []string
 	trustedProxies conf.IPNetworks
 	readTimeout    conf.Duration
 	writeTimeout   conf.Duration
@@ -90,11 +90,12 @@ func (s *httpServer) initialize() error {
 	router := gin.New()
 	router.SetTrustedProxies(s.trustedProxies.ToTrustedProxies()) //nolint:errcheck
 
-	router.Use(s.middlewareOrigin)
+	// router.Use(s.middlewareOrigin)
 	router.Use(s.onRequest)
 
 	s.inner = &httpp.Server{
 		Address:      s.address,
+		AllowOrigins: s.allowOrigins,
 		ReadTimeout:  time.Duration(s.readTimeout),
 		WriteTimeout: time.Duration(s.writeTimeout),
 		Encryption:   s.encryption,
@@ -141,7 +142,7 @@ func (s *httpServer) wrapHandler(h func(http.ResponseWriter, *http.Request)) gin
 }
 
 // Log implements logger.Writer.
-func (s *httpServer) Log(level logger.Level, format string, args ...interface{}) {
+func (s *httpServer) Log(level logger.Level, format string, args ...any) {
 	s.parent.Log(level, format, args...)
 }
 
@@ -347,11 +348,7 @@ func (s *httpServer) onPage(ctx *gin.Context, pathName string, publish bool) {
 	}
 }
 
-func (s *httpServer) middlewareOrigin(ctx *gin.Context) {
-	ctx.Header("Access-Control-Allow-Origin", s.allowOrigin)
-	ctx.Header("Access-Control-Allow-Credentials", "true")
-
-	// preflight requests
+func (s *httpServer) middlewarePreflightRequests(ctx *gin.Context) {
 	if ctx.Request.Method == http.MethodOptions &&
 		ctx.Request.Header.Get("Access-Control-Request-Method") != "" {
 		ctx.Header("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PATCH, DELETE")

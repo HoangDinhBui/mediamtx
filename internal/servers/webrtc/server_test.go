@@ -66,7 +66,7 @@ func initializeTestServer(t *testing.T) *Server {
 
 	s := &Server{
 		Address:               "127.0.0.1:8886",
-		AllowOrigin:           "*",
+		AllowOrigins:          []string{"*"},
 		TrustedProxies:        conf.IPNetworks{},
 		ReadTimeout:           conf.Duration(10 * time.Second),
 		WriteTimeout:          conf.Duration(10 * time.Second),
@@ -751,7 +751,7 @@ func TestAuthError(t *testing.T) {
 				return nil, &auth.Error{Wrapped: fmt.Errorf("auth error")}
 			},
 		},
-		Parent: test.Logger(func(l logger.Level, s string, i ...interface{}) {
+		Parent: test.Logger(func(l logger.Level, s string, i ...any) {
 			if l == logger.Info {
 				if n == 1 {
 					require.Regexp(t, "failed to authenticate: auth error$", fmt.Sprintf(s, i...))

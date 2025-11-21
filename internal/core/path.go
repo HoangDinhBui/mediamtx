@@ -70,6 +70,7 @@ type path struct {
 	readTimeout       conf.Duration
 	writeTimeout      conf.Duration
 	writeQueueSize    int
+	udpReadBufferSize uint
 	rtpMaxPayloadSize int
 	conf              *conf.Path
 	name              string
@@ -149,7 +150,7 @@ func (pa *path) wait() {
 }
 
 // Log implements logger.Writer.
-func (pa *path) Log(level logger.Level, format string, args ...interface{}) {
+func (pa *path) Log(level logger.Level, format string, args ...any) {
 	pa.parent.Log(level, "[path "+pa.name+"] "+format, args...)
 }
 
@@ -174,6 +175,7 @@ func (pa *path) run() {
 			ReadTimeout:       pa.readTimeout,
 			WriteTimeout:      pa.writeTimeout,
 			WriteQueueSize:    pa.writeQueueSize,
+			UDPReadBufferSize: pa.udpReadBufferSize,
 			RTPMaxPayloadSize: pa.rtpMaxPayloadSize,
 			Matches:           pa.matches,
 			PathManager:       pa.parent,

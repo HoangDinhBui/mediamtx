@@ -62,8 +62,6 @@ func interfaceIPs(interfaceList []string) ([]string, error) {
 	return ips, nil
 }
 
-// * skip ConfigureRTCPReports
-// * add statsInterceptor
 func registerInterceptors(
 	mediaEngine *webrtc.MediaEngine,
 	interceptorRegistry *interceptor.Registry,
@@ -142,6 +140,7 @@ type trackRecvPair struct {
 
 // PeerConnection is a wrapper around webrtc.PeerConnection.
 type PeerConnection struct {
+	UDPReadBufferSize     uint
 	LocalRandomUDP        bool
 	ICEUDPMux             ice.UDPMux
 	ICETCPMux             *TCPMuxWrapper
@@ -156,15 +155,12 @@ type PeerConnection struct {
 	OutgoingTracks        []*OutgoingTrack
 	Log                   logger.Writer
 
-	wr                 *webrtc.PeerConnection
-	ctx                context.Context
-	ctxCancel          context.CancelFunc
-	incomingTracks     []*IncomingTrack
-	startedReading     *int64
-	rtpPacketsReceived *uint64
-	rtpPacketsSent     *uint64
-	rtpPacketsLost     *uint64
-	statsInterceptor   *statsInterceptor
+	wr               *webrtc.PeerConnection
+	ctx              context.Context
+	ctxCancel        context.CancelFunc
+	incomingTracks   []*IncomingTrack
+	startedReading   *int64
+	statsInterceptor *statsInterceptor
 
 	newLocalCandidate chan *webrtc.ICECandidateInit
 	incomingTrack     chan trackRecvPair
@@ -374,7 +370,7 @@ func (co *PeerConnection) Start() error {
 
 	interceptorRegistry := &interceptor.Registry{}
 
-	err := registerInterceptors(
+	var err = registerInterceptors(
 		mediaEngine,
 		interceptorRegistry,
 		func(s *statsInterceptor) {
@@ -444,9 +440,6 @@ func (co *PeerConnection) Start() error {
 	co.ctx, co.ctxCancel = context.WithCancel(context.Background())
 
 	co.startedReading = new(int64)
-	co.rtpPacketsReceived = new(uint64)
-	co.rtpPacketsSent = new(uint64)
-	co.rtpPacketsLost = new(uint64)
 
 	co.newLocalCandidate = make(chan *webrtc.ICECandidateInit)
 	co.connected = make(chan struct{})
@@ -1780,12 +1773,10 @@ func (co *PeerConnection) GatherIncomingTracks() error {
 			co.Log.Log(logger.Info, "[Track-Gather] ✓ Received track %d/%d: %s", 
 				len(co.incomingTracks)+1, maxTrackCount, pair.track.Kind().String())
 			t := &IncomingTrack{
-				track:              pair.track,
-				receiver:           pair.receiver,
-				writeRTCP:          co.wr.WriteRTCP,
-				log:                co.Log,
-				rtpPacketsReceived: co.rtpPacketsReceived,
-				rtpPacketsLost:     co.rtpPacketsLost,
+				track:     pair.track,
+				receiver:  pair.receiver,
+				writeRTCP: co.wr.WriteRTCP,
+				log:       co.Log,
 			}
 			t.initialize()
 			co.incomingTracks = append(co.incomingTracks, t)
@@ -1958,13 +1949,24 @@ func (co *PeerConnection) Stats() *Stats {
 
 	v := float64(0)
 	n := float64(0)
+	packetsReceived := uint64(0)
+	packetsSent := uint64(0)
+	packetsLost := uint64(0)
 
 	if atomic.LoadInt64(co.startedReading) == 1 {
 		for _, tr := range co.incomingTracks {
-			if recvStats := tr.rtcpReceiver.Stats(); recvStats != nil {
+			if recvStats := tr.rtpReceiver.Stats(); recvStats != nil {
 				v += recvStats.Jitter
 				n++
+				packetsReceived += recvStats.TotalReceived
+				packetsLost += recvStats.TotalLost
 			}
+		}
+	}
+
+	for _, tr := range co.OutgoingTracks {
+		if sentStats := tr.rtcpSender.Stats(); sentStats != nil {
+			packetsSent += sentStats.TotalSent
 		}
 	}
 
@@ -1978,9 +1980,9 @@ func (co *PeerConnection) Stats() *Stats {
 	return &Stats{
 		BytesReceived:       bytesReceived,
 		BytesSent:           bytesSent,
-		RTPPacketsReceived:  atomic.LoadUint64(co.rtpPacketsReceived),
-		RTPPacketsSent:      atomic.LoadUint64(co.rtpPacketsSent),
-		RTPPacketsLost:      atomic.LoadUint64(co.rtpPacketsLost),
+		RTPPacketsReceived:  packetsReceived,
+		RTPPacketsSent:      packetsSent,
+		RTPPacketsLost:      packetsLost,
 		RTPPacketsJitter:    rtpPacketsJitter,
 		RTCPPacketsReceived: atomic.LoadUint64(co.statsInterceptor.rtcpPacketsReceived),
 		RTCPPacketsSent:     atomic.LoadUint64(co.statsInterceptor.rtcpPacketsSent),
