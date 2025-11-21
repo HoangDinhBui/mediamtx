@@ -91,7 +91,6 @@ func (s *httpServer) initialize() error {
 	router.SetTrustedProxies(s.trustedProxies.ToTrustedProxies()) //nolint:errcheck
 
 	router.Use(s.middlewareOrigin)
-
 	router.Use(s.onRequest)
 
 	s.inner = &httpp.Server{
@@ -104,12 +103,41 @@ func (s *httpServer) initialize() error {
 		Handler:      router,
 		Parent:       s,
 	}
+
+	// ========== CUSTOM API ROUTES  ==========
+	// FPT Camera API
+	router.POST("/v3/webrtc/fpt/trigger", s.wrapHandler(s.parent.APITriggerFPTStream))
+	router.GET("/v3/webrtc/fpt/cameras", s.wrapHandler(s.parent.APIListFPTCameras))
+	router.GET("/v3/webrtc/fpt/datachannel", s.wrapHandler(s.parent.APITestDataChannel))
+	
+	router.POST("/v3/webrtc/:path/:subpath/datachannel/send", s.onDataChannelSendWithSubpath)
+	router.POST("/v3/webrtc/:path/datachannel/send", s.onDataChannelSend)
+	router.POST("/:path/datachannel/send", s.onDataChannelSend)
+	router.POST("/:path/:subpath/datachannel/send", s.onDataChannelSendWithSubpath)
+	// WebSocket needs raw http.Handler to support Hijacker interface
+	router.GET("/v3/webrtc/fpt/ws", gin.WrapF(s.parent.HandleWebSocketDataChannelRelay))
+	
+	// Recording APIs
+	router.POST("/v3/webrtc/record/start", s.wrapHandler(s.parent.APIStartRecording))
+	router.POST("/v3/webrtc/record/stop", s.wrapHandler(s.parent.APIStopRecording))
+	router.GET("/v3/webrtc/record/status", s.wrapHandler(s.parent.APIRecordingStatus))
+	router.GET("/v3/webrtc/record/list", s.wrapHandler(s.parent.APIListRecordings))
+	router.GET("/v3/webrtc/record/download", s.wrapHandler(s.parent.APIDownloadRecording))
+	
+	s.Log(logger.Info, "[HTTP] Custom API routes registered")
+
 	err := s.inner.Initialize()
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (s *httpServer) wrapHandler(h func(http.ResponseWriter, *http.Request)) gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		h(ctx.Writer, ctx.Request)
+	}
 }
 
 // Log implements logger.Writer.

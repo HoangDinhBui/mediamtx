@@ -1,8 +1,10 @@
 package httpp
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 
@@ -32,6 +34,14 @@ func (w *loggerWriter) WriteHeader(statusCode int) {
 	w.w.WriteHeader(statusCode)
 }
 
+// Hijack implements http.Hijacker for WebSocket support
+func (w *loggerWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hijacker, ok := w.w.(http.Hijacker); ok {
+		return hijacker.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support Hijack")
+}
+
 func (w *loggerWriter) dump() string {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "%s %d %s\n", "HTTP/1.1", w.status, http.StatusText(w.status))
@@ -50,6 +60,12 @@ type handlerLogger struct {
 }
 
 func (h *handlerLogger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Skip logging wrapper for WebSocket upgrade endpoints
+	if r.URL.Path == "/v3/webrtc/fpt/ws" {
+		h.h.ServeHTTP(w, r)
+		return
+	}
+	
 	byts, _ := httputil.DumpRequest(r, true)
 	h.log.Log(logger.Debug, "[conn %v] [c->s] %s", r.RemoteAddr, string(byts))
 

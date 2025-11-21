@@ -7,13 +7,20 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"github.com/gin-gonic/gin"
+
+	// "net/url"
+	"os"
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -145,6 +152,8 @@ type webRTCNewSessionReq struct {
 	publish     bool
 	httpRequest *http.Request
 	res         chan webRTCNewSessionRes
+	answerCh    chan *pwebrtc.SessionDescription
+	clientID string
 }
 
 type webRTCAddSessionCandidatesRes struct {
@@ -167,6 +176,16 @@ type webRTCDeleteSessionReq struct {
 	pathName string
 	secret   uuid.UUID
 	res      chan webRTCDeleteSessionRes
+}
+
+type webRTCGetSessionByPathRes struct {
+	sx  *session
+	err error
+}
+
+type webRTCGetSessionByPathReq struct {
+	pathName string
+	res      chan webRTCGetSessionByPathRes
 }
 
 type serverMetrics interface {
@@ -217,6 +236,19 @@ type Server struct {
 	sessions         map[*session]struct{}
 	sessionsBySecret map[uuid.UUID]*session
 
+	// --- MQTT signaling config / state (ADD) ---
+	MQTTEnabled      bool
+	MQTTBrokerURL    string
+	MQTTTopicPrefix  string
+
+	mqttSignaler     *MQTTSignaler
+	sessionsByPath   map[string]*session
+	sessionsMutex    sync.RWMutex // Protect sessionsByPath for WebSocket access
+
+	// FPT Camera adapter (NEW)
+	fptAdapter *FPTCameraAdapter
+	recorder   *Recorder
+
 	// in
 	chNewSession           chan webRTCNewSessionReq
 	chCloseSession         chan *session
@@ -225,9 +257,103 @@ type Server struct {
 	chAPISessionsList      chan serverAPISessionsListReq
 	chAPISessionsGet       chan serverAPISessionsGetReq
 	chAPIConnsKick         chan serverAPISessionsKickReq
+	chGetSessionByPath     chan webRTCGetSessionByPathReq
 
 	// out
 	done chan struct{}
+}
+
+// ---- MQTT PubAPI implementation (ADD) ----
+type mqttPubAPI struct{ 
+	s *Server
+	mu sync.Mutex
+    	sessKeyByPath map[string]uuid.UUID
+ }
+
+// Create publisher (Offer -> Answer) via Server.newSession
+func (a *mqttPubAPI) CreatePublisherFromOffer(path, offerSDP string) (string, error) {
+	a.s.Log(logger.Info, "[MQTT-API] CreatePublisherFromOffer called for path=%s", path)
+
+	// Create answer channel
+	answerCh := make(chan *pwebrtc.SessionDescription, 1)
+	a.s.Log(logger.Info, "[MQTT-API] Created answerCh (buffered size=1)")
+
+	// Create session request
+	req := webRTCNewSessionReq{
+		pathName:    path,
+		remoteAddr:  "127.0.0.1:0",
+		offer:       []byte(offerSDP),
+		publish:     true,
+		httpRequest: nil,
+		answerCh:    answerCh,
+	}
+
+	// Request Server to create session
+	a.s.Log(logger.Info, "[MQTT-API] Calling newSession...")
+	res := a.s.newSession(req)
+	if res.err != nil {
+		a.s.Log(logger.Error, "[MQTT-API] newSession failed: %v", res.err)
+		return "", res.err
+	}
+	if res.sx == nil {
+		a.s.Log(logger.Error, "[MQTT-API] session is nil")
+		return "", fmt.Errorf("session is nil after newSession")
+	}
+
+	a.s.Log(logger.Info, "[MQTT-API] Session created successfully, waiting for answer...")
+
+	// Save session key for AddRemoteCandidate
+	a.mu.Lock()
+	if a.sessKeyByPath == nil {
+		a.sessKeyByPath = make(map[string]uuid.UUID)
+	}
+	a.sessKeyByPath[path] = res.sx.secret
+	a.mu.Unlock()
+
+	// Wait for answer from channel
+	select {
+	case ans := <-answerCh:
+		if ans == nil {
+			a.s.Log(logger.Error, "[MQTT-API] Received nil answer")
+			return "", fmt.Errorf("received nil answer")
+		}
+		if ans.SDP == "" {
+			a.s.Log(logger.Error, "[MQTT-API] Received empty SDP")
+			return "", fmt.Errorf("received empty SDP")
+		}
+
+		a.s.Log(logger.Info, "[MQTT-API] Got answer from channel (len=%d), returning", len(ans.SDP))
+		return ans.SDP, nil
+
+	case <-time.After(30 * time.Second):
+		a.s.Log(logger.Error, "[MQTT-API] Timeout waiting for answer (30s)")
+		return "", fmt.Errorf("timeout waiting for answer")
+	}
+}
+
+// Add remote ICE candidate from publisher (MQTT -> server)
+func (a *mqttPubAPI) AddRemoteCandidate(path, cand string) error {
+    a.mu.Lock()
+    key, ok := a.sessKeyByPath[path]
+    a.mu.Unlock()
+    if !ok {
+        return fmt.Errorf("session key not found for path=%s", path)
+    }
+
+    init := &pwebrtc.ICECandidateInit{Candidate: cand}
+    resp := a.s.addSessionCandidates(webRTCAddSessionCandidatesReq{
+        pathName:   path,
+        secret:     key,
+        candidates: []*pwebrtc.ICECandidateInit{init},
+    })
+    if resp.err != nil {
+        a.s.Log(logger.Error, "[WebRTC][MQTT] addCandidate error path=%s err=%v", path, resp.err)
+    }
+    return resp.err
+}
+
+// (Phase-2) cho phép server đẩy ICE local ra MQTT (callback đăng ký từ session)
+func (a *mqttPubAPI) OnLocalICE(path string, fn func(cand string)) {
 }
 
 // Initialize initializes the server.
@@ -238,6 +364,7 @@ func (s *Server) Initialize() error {
 	s.ctxCancel = ctxCancel
 	s.sessions = make(map[*session]struct{})
 	s.sessionsBySecret = make(map[uuid.UUID]*session)
+	s.sessionsByPath = make(map[string]*session)
 	s.chNewSession = make(chan webRTCNewSessionReq)
 	s.chCloseSession = make(chan *session)
 	s.chAddSessionCandidates = make(chan webRTCAddSessionCandidatesReq)
@@ -245,6 +372,7 @@ func (s *Server) Initialize() error {
 	s.chAPISessionsList = make(chan serverAPISessionsListReq)
 	s.chAPISessionsGet = make(chan serverAPISessionsGetReq)
 	s.chAPIConnsKick = make(chan serverAPISessionsKickReq)
+	s.chGetSessionByPath = make(chan webRTCGetSessionByPathReq)
 	s.done = make(chan struct{})
 
 	s.httpServer = &httpServer{
@@ -302,11 +430,337 @@ func (s *Server) Initialize() error {
 
 	go s.run()
 
+	// ========================================================================
+	// MQTT SIGNALING (OPTIONAL)
+	// ========================================================================
+	if !s.MQTTEnabled {
+		if getenv("MQTT_ENABLED", "1") == "1" {
+			s.MQTTEnabled = true
+			s.MQTTBrokerURL   = getenv("MQTT_BROKER_URL",  "tcp://127.0.0.1:1883")
+			s.MQTTTopicPrefix = getenv("MQTT_TOPIC_PREFIX", "webrtc")
+		}
+	}
+
+	if s.MQTTEnabled {
+		api := &mqttPubAPI{s: s, sessKeyByPath: make(map[string]uuid.UUID)}
+		s.mqttSignaler = NewMQTTSignaler(s.MQTTBrokerURL, s.MQTTTopicPrefix, api,
+			func(format string, args ...any) { s.Log(logger.Info, format, args...) })
+
+		if err := s.mqttSignaler.Start(s.ctx); err != nil {
+			s.Log(logger.Error, "MQTT signaling start failed: %v", err)
+		}
+	}
+
+	/*
+	 FPT CAMERA ADAPTER INITIALIZATION
+	*/
+	if os.Getenv("FPT_CAMERA_ENABLED") == "1" {
+		s.Log(logger.Info, "[WebRTC] [FPT] Initializing FPT Camera Adapter")
+		
+		// serial := os.Getenv("FPT_CAMERA_SERIAL")
+		brokerURL := os.Getenv("FPT_MQTT_BROKER")
+		username := os.Getenv("FPT_MQTT_USER")
+		password := os.Getenv("FPT_MQTT_PASS")
+		
+		if brokerURL == "" {
+			s.Log(logger.Warn, "[WebRTC] [FPT] FPT_MQTT_BROKER not set (adapter disabled)")
+		} else {
+			s.Log(logger.Info, "[WebRTC] [FPT] Configuration:")
+			s.Log(logger.Info, "[WebRTC] [FPT]   - Broker: %s", brokerURL)
+			s.Log(logger.Info, "[WebRTC] [FPT]   - Username: %s", username)
+			
+			// Step 1: Create adapter instance
+			s.fptAdapter = NewFPTCameraAdapter(brokerURL, username, password, s)
+			s.fptAdapter.server = s  // Set server reference for trickle ICE
+			s.Log(logger.Info, "[WebRTC] [FPT] Adapter instance created")
+			
+			// Step 2: Register OnOffer callback BEFORE Start()
+			s.Log(logger.Info, "[WebRTC] [FPT] Registering OnOffer callback...")
+			
+			s.fptAdapter.SetOnOffer(func(serial, clientID, cleanedSDP string) (string, error) {
+				s.Log(logger.Info, "[FPT] OnOffer CALLBACK TRIGGERED!")
+				s.Log(logger.Info, "[FPT] Parameters:")
+				s.Log(logger.Info, "[FPT]   - ClientID: %s", clientID)
+				s.Log(logger.Info, "[FPT]   - SDP length: %d bytes", len(cleanedSDP))
+				
+				// DATACHANNEL SUPPORT: Allow DataChannel in SDP for camera streaming
+				if strings.Contains(cleanedSDP, "m=application") {
+					s.Log(logger.Info, "[FPT] DataChannel present in SDP (camera streaming support)")
+				} else {
+					s.Log(logger.Warn, "[FPT] No DataChannel in SDP - camera may not support streaming")
+				}
+				
+				// Log SDP structure
+				hasVideo := strings.Contains(cleanedSDP, "m=video")
+				hasAudio := strings.Contains(cleanedSDP, "m=audio")
+				s.Log(logger.Info, "[FPT] SDP structure:")
+				s.Log(logger.Info, "[FPT]   - Video: %v", hasVideo)
+				s.Log(logger.Info, "[FPT]   - Audio: %v", hasAudio)
+				
+				// Create path name
+				pathName := fmt.Sprintf("fpt/%s", serial)
+				s.Log(logger.Info, "[FPT] Dynamic path: %s", pathName)
+				
+				// Verify SDP ends with \r\n
+				if !strings.HasSuffix(cleanedSDP, "\r\n") {
+					cleanedSDP += "\r\n"
+				}
+				
+				// Create answer channel
+				answerCh := make(chan *pwebrtc.SessionDescription, 1)
+				defer close(answerCh)
+				
+				// Create session request (MQTT mode)
+				req := webRTCNewSessionReq{
+					pathName:    pathName,
+					remoteAddr:  fmt.Sprintf("mqtt-camera-%s", serial),
+					offer:       []byte(cleanedSDP),
+					publish:     true, // Camera publishes TO server
+					httpRequest: nil,  // No HTTP (MQTT mode)
+					res:         nil,  // No HTTP response channel
+					answerCh:    answerCh, // MQTT answer channel
+				}
+				
+				s.Log(logger.Info, "[FPT] Creating session for camera %s...", serial)
+				
+				res := s.newSession(req)
+				
+				if res.err != nil {
+					s.Log(logger.Error, "[FPT] newSession() failed: %v", res.err)
+					return "", res.err
+				}
+				
+				if res.sx == nil {
+					s.Log(logger.Error, "[FPT] Session is nil!")
+					return "", fmt.Errorf("nil session returned")
+				}
+				
+				sessionID := res.sx.uuid.String()[:8]
+				s.Log(logger.Info, "[FPT] Session created (UUID=%s)", sessionID)
+				
+				// Register session for trickle ICE
+				s.fptAdapter.RegisterSession(serial, pathName, res.sx.secret, clientID)
+				
+				s.Log(logger.Info, "[FPT] Waiting for answer from session...")
+				
+				select {
+				case ans := <-answerCh:
+					if ans == nil || ans.SDP == ""{
+						s.Log(logger.Error, "[FPT] Empty answer")
+						return "", fmt.Errorf("nil answer")
+					}
+					
+					s.Log(logger.Info, "[FPT] ANSWER RECEIVED FROM SESSION!")
+					s.Log(logger.Info, "[FPT]   - Length: %d bytes", len(ans.SDP))
+					
+					// Verify answer structure
+					s.Log(logger.Info, "[FPT] Answer structure:")
+					s.Log(logger.Info, "[FPT]   - Video: %v", strings.Contains(ans.SDP, "m=video"))
+					s.Log(logger.Info, "[FPT]   - Audio: %v", strings.Contains(ans.SDP, "m=audio"))
+					
+					s.Log(logger.Info, "[FPT] OnOffer CALLBACK COMPLETE")
+					
+					return ans.SDP, nil
+					
+				case <-time.After(30 * time.Second):
+					s.Log(logger.Error, "[FPT] TIMEOUT waiting for answer (30s)")
+					
+					// Try to close the session
+					if res.sx != nil {
+						res.sx.Close()
+					}
+					
+					return "", fmt.Errorf("answer timeout (30s)")
+				}
+			})
+			
+			s.Log(logger.Info, "[WebRTC] [FPT] OnOffer callback registered")
+			
+			// Step 3: Start adapter (connects to MQTT)
+			s.Log(logger.Info, "[WebRTC] [FPT] Starting MQTT connection...")
+			
+			if err := s.fptAdapter.Start(); err != nil {
+				s.Log(logger.Error, "[WebRTC] [FPT] Adapter start failed: %v", err)
+			} else {
+				s.Log(logger.Info, "[WebRTC] [FPT] Adapter started successfully")
+			}
+		}
+	}
+
+	// ========================================================================
+	// RECORDER INITIALIZATION
+	// ========================================================================
+	if os.Getenv("RECORDING_ENABLED") == "1" {
+		outputDir := os.Getenv("RECORDING_OUTPUT_DIR")
+		if outputDir == "" {
+			outputDir = "./recordings"
+		}
+		
+		s.Log(logger.Info, "[Recorder] Initializing recorder (output: %s)", outputDir)
+		s.recorder = NewRecorder(outputDir, s)
+		s.Log(logger.Info, "[Recorder] READY!")
+	}
+
+	// ========================================================================
+	// TURN/STUN CONFIGURATION
+	// ========================================================================
+	turnURL := os.Getenv("TURN_SERVER_URL")
+	if turnURL == "" {
+		turnURL = "turn:turn-connect.fcam.vn:3478"  // Default FPT TURN
+	}
+
+	turnUser := os.Getenv("TURN_USERNAME")
+	turnPass := os.Getenv("TURN_PASSWORD")
+
+	if turnUser != "" && turnPass != "" {
+		turnServer := conf.WebRTCICEServer{
+			URL:      turnURL,
+			Username: turnUser,
+			Password: turnPass,
+		}
+		s.ICEServers = append(s.ICEServers, turnServer)
+		s.Log(logger.Info, "FPT TURN server: %s (user: %s)", turnURL, turnUser)
+	} else {
+		s.Log(logger.Warn, "TURN credentials not set - relay may fail!")
+	}
+
+	// Add FPT STUN Servers (from camera ICE servers)
+	fptStunServers := []string{
+		"stun:stun-connect.fcam.vn:3478",
+		"stun:stunp-connect.fcam.vn:3478",
+	}
+
+	for _, stunURL := range fptStunServers {
+		s.ICEServers = append(s.ICEServers, conf.WebRTCICEServer{
+			URL: stunURL,
+		})
+		s.Log(logger.Info, "FPT STUN server: %s", stunURL)
+	}
+
+	stunServers := os.Getenv("WEBRTC_STUN_SERVERS")
+	if stunServers == "" {
+		stunServers = "stun:stun.l.google.com:19302"
+	}
+	for _, stunURL := range strings.Split(stunServers, ",") {
+		stunURL = strings.TrimSpace(stunURL)
+		if stunURL != "" {
+			s.ICEServers = append(s.ICEServers, conf.WebRTCICEServer{
+				URL: stunURL,
+			})
+		}
+	}
+
+	s.Log(logger.Info, "=== ICE Servers Configuration ===")
+	for i, srv := range s.ICEServers {
+		if srv.Username != "" {
+			s.Log(logger.Info, "  [%d] %s (auth: yes)", i+1, srv.URL)
+		} else {
+			s.Log(logger.Info, "  [%d] %s", i+1, srv.URL)
+		}
+	}
+
+	// ========================================================================
+	// PUBLIC IP CONFIGURATION
+	// ========================================================================
+	if os.Getenv("WEBRTC_AUTO_DETECT_IP") == "1" {
+		publicIP := detectPublicIP(s)
+		if publicIP != "" {
+			s.AdditionalHosts = append(s.AdditionalHosts, publicIP)
+			s.Log(logger.Info, "Auto-detected public IP: %s", publicIP)
+		}
+	}
+
+	if manualIP := os.Getenv("WEBRTC_PUBLIC_IP"); manualIP != "" {
+		s.AdditionalHosts = append(s.AdditionalHosts, manualIP)
+		s.Log(logger.Info, "Using manual public IP: %s", manualIP)
+	}
+
+	// ========================================================================
+	// METRICS
+	// ========================================================================
 	if !interfaceIsEmpty(s.Metrics) {
 		s.Metrics.SetWebRTCServer(s)
 	}
 
 	return nil
+}
+
+func detectPublicIP(s *Server) string {
+    endpoints := []string{
+        "https://api.ipify.org",
+        "https://ifconfig.me",
+        "https://icanhazip.com",
+    }
+
+    client := &http.Client{Timeout: 5 * time.Second}
+
+    for _, endpoint := range endpoints {
+        resp, err := client.Get(endpoint)
+        if err != nil {
+            continue
+        }
+        defer resp.Body.Close()
+
+        body, err := io.ReadAll(resp.Body)
+        if err != nil {
+            continue
+        }
+
+        ip := strings.TrimSpace(string(body))
+        if net.ParseIP(ip) != nil {
+            return ip
+        }
+    }
+
+    s.Log(logger.Warn, "Could not auto-detect public IP")
+    return ""
+}
+
+// handleFPTCameraOffer processes SDP offer from FPT camera
+// Converts Bundle ICE (camera) → MediaMTX session → SDP answer
+func (s *Server) handleFPTCameraOffer(serial, clientID, cleanedSDP string) (string, error) {
+	s.Log(logger.Info, "[FPT] Processing camera offer (serial=%s, clientID=%s)", serial, clientID)
+	
+	pathName := fmt.Sprintf("fpt/%s", serial)
+	// Create answer channel for async response
+	answerCh := make(chan *pwebrtc.SessionDescription, 1)
+	
+	// Create session request
+	req := webRTCNewSessionReq{
+		pathName:    pathName,
+		remoteAddr:  "0.0.0.0:0",
+		offer:       []byte(cleanedSDP),
+		publish:     true,
+		httpRequest: nil,
+		answerCh:    answerCh,
+		clientID: clientID,
+	}
+	
+	// Create session via existing newSession logic
+	res := s.newSession(req)
+	if res.err != nil {
+		s.Log(logger.Error, "[FPT] newSession failed: %v", res.err)
+		return "", fmt.Errorf("newSession failed: %w", res.err)
+	}
+	
+	s.fptAdapter.RegisterSession(serial, pathName, res.sx.secret, clientID)
+
+	s.Log(logger.Info, "[FPT] Session created (UUID=%s), waiting for answer...", res.sx.uuid)
+	
+	// Wait for answer from session goroutine
+	select {
+	case ans := <-answerCh:
+		if ans == nil || ans.SDP == "" {
+			s.Log(logger.Error, "[FPT] Received empty answer")
+			return "", fmt.Errorf("empty answer received")
+		}
+		s.Log(logger.Info, "[FPT] Got answer (SDP len=%d)", len(ans.SDP))
+		return ans.SDP, nil
+		
+	case <-time.After(30 * time.Second):
+		s.Log(logger.Error, "[FPT] Timeout waiting for answer")
+		return "", fmt.Errorf("timeout waiting for answer (30s)")
+	}
 }
 
 // Log implements logger.Writer.
@@ -320,6 +774,14 @@ func (s *Server) Close() {
 
 	if !interfaceIsEmpty(s.Metrics) {
 		s.Metrics.SetWebRTCServer(nil)
+	}
+
+	if s.recorder != nil {
+		s.recorder.Close()
+	}
+	
+	if s.fptAdapter != nil {
+		s.fptAdapter.Close()
 	}
 
 	s.ctxCancel()
@@ -354,11 +816,19 @@ outer:
 			sx.initialize()
 			s.sessions[sx] = struct{}{}
 			s.sessionsBySecret[sx.secret] = sx
+			s.sessionsMutex.Lock()
+			s.sessionsByPath[req.pathName] = sx
+			s.sessionsMutex.Unlock()
 			req.res <- webRTCNewSessionRes{sx: sx}
 
 		case sx := <-s.chCloseSession:
 			delete(s.sessions, sx)
 			delete(s.sessionsBySecret, sx.secret)
+			s.sessionsMutex.Lock()
+			if cur, ok := s.sessionsByPath[sx.req.pathName]; ok && cur == sx {
+				delete(s.sessionsByPath, sx.req.pathName)
+			}
+			s.sessionsMutex.Unlock()
 
 		case req := <-s.chAddSessionCandidates:
 			sx, ok := s.sessionsBySecret[req.secret]
@@ -378,6 +848,9 @@ outer:
 
 			delete(s.sessions, sx)
 			delete(s.sessionsBySecret, sx.secret)
+			if cur, ok := s.sessionsByPath[sx.req.pathName]; ok && cur == sx {
+				delete(s.sessionsByPath, sx.req.pathName)
+			}
 			sx.Close()
 
 			req.res <- webRTCDeleteSessionRes{}
@@ -480,14 +953,21 @@ func (s *Server) generateICEServers(clientConfig bool) ([]pwebrtc.ICEServer, err
 	return ret, nil
 }
 
-// newSession is called by webRTCHTTPServer.
+// newSession is called by webRTCHTTPServer and MQTT signaler
 func (s *Server) newSession(req webRTCNewSessionReq) webRTCNewSessionRes {
-	req.res = make(chan webRTCNewSessionRes)
+	req.res = make(chan webRTCNewSessionRes, 1)
 
 	select {
 	case s.chNewSession <- req:
 		res := <-req.res
 
+		// For MQTT mode: don't call sx.new() - let CreatePublisherFromOffer handle the answer flow
+		if req.answerCh != nil {
+			s.Log(logger.Info, "[Server] MQTT mode: session running")
+			return res
+		}
+		s.Log(logger.Debug, "[Server] HTTP mode: calling sx.new()")
+		// For HTTP mode: call sx.new() to complete the handshake
 		return res.sx.new(req)
 
 	case <-s.ctx.Done():
@@ -496,6 +976,18 @@ func (s *Server) newSession(req webRTCNewSessionReq) webRTCNewSessionRes {
 			err:           fmt.Errorf("terminated"),
 		}
 	}
+}
+
+// getSessionByPath safely retrieves a session by path name.
+func (s *Server) getSessionByPath(pathName string) (*session, error) {
+	s.sessionsMutex.RLock()
+	defer s.sessionsMutex.RUnlock()
+	
+	sx, ok := s.sessionsByPath[pathName]
+	if !ok {
+		return nil, fmt.Errorf("session not found for path: %s", pathName)
+	}
+	return sx, nil
 }
 
 // closeSession is called by session.
@@ -586,4 +1078,202 @@ func (s *Server) APISessionsKick(uuid uuid.UUID) error {
 	case <-s.ctx.Done():
 		return fmt.Errorf("terminated")
 	}
+}
+
+func getenv(k, fallback string) string {
+    if v := os.Getenv(k); v != "" { return v }
+    return fallback
+}
+
+func ternary[T any](cond bool, a, b T) T { if cond { return a }; return b }
+
+// APIDataChannelSend sends command to camera via DataChannel
+func (s *Server) APIDataChannelSend(w http.ResponseWriter, r *http.Request) {
+	// Extract path from URL (e.g., /v3/webrtc/fpt/c02i24040003273/datachannel/send)
+	pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v3/webrtc/"), "/")
+	if len(pathParts) < 3 {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+	
+	// Reconstruct path (e.g., "fpt/c02i24040003273")
+	pathName := strings.Join(pathParts[:len(pathParts)-2], "/")
+	
+	s.Log(logger.Info, "[DataChannel-API] Send command request for path: %s", pathName)
+	
+	// Parse JSON command
+	var cmd map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+		return
+	}
+	
+	s.Log(logger.Info, "[DataChannel-API] Command: %+v", cmd)
+	
+	// Get active session
+	sess, err := s.getSessionByPath(pathName)
+	if err != nil {
+		s.Log(logger.Warn, "[DataChannel-API] Session not found: %s", pathName)
+		http.Error(w, fmt.Sprintf("Session not found: %v", err), http.StatusNotFound)
+		return
+	}
+	
+	// Get PeerConnection
+	sess.mutex.RLock()
+	pc := sess.pc
+	sess.mutex.RUnlock()
+	
+	if pc == nil {
+		s.Log(logger.Warn, "[DataChannel-API] PeerConnection not ready")
+		http.Error(w, "PeerConnection not ready", http.StatusServiceUnavailable)
+		return
+	}
+	
+	// Wait for DataChannel (timeout 5s)
+	s.Log(logger.Info, "[DataChannel-API] Waiting for DataChannel...")
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	
+	done := make(chan error, 1)
+	go func() {
+		done <- pc.WaitDataChannelReady()
+	}()
+	
+	select {
+	case err := <-done:
+		if err != nil {
+			s.Log(logger.Error, "[DataChannel-API] DataChannel not ready: %v", err)
+			http.Error(w, fmt.Sprintf("DataChannel not ready: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+	case <-ctx.Done():
+		s.Log(logger.Error, "[DataChannel-API] Timeout waiting for DataChannel")
+		http.Error(w, "Timeout waiting for DataChannel", http.StatusGatewayTimeout)
+		return
+	}
+	
+	// Send command
+	data, _ := json.Marshal(cmd)
+	err = pc.SendDataChannelMessage(data, true)
+	if err != nil {
+		s.Log(logger.Error, "[DataChannel-API] Failed to send: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to send: %v", err), http.StatusInternalServerError)
+		return
+	}
+	
+	s.Log(logger.Info, "[DataChannel-API] Command sent successfully!")
+	
+	// Return success response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "sent",
+		"command": cmd,
+		"path":    pathName,
+	})
+}
+
+// onDataChannelSend handles /:path/datachannel/send
+func (s *httpServer) onDataChannelSend(ctx *gin.Context) {
+	path := ctx.Param("path")
+	s.handleDataChannelSend(ctx, path)
+}
+
+// onDataChannelSendWithSubpath handles /:path/:subpath/datachannel/send
+func (s *httpServer) onDataChannelSendWithSubpath(ctx *gin.Context) {
+	path := ctx.Param("path")
+	subpath := ctx.Param("subpath")
+	fullPath := path + "/" + subpath
+	s.handleDataChannelSend(ctx, fullPath)
+}
+
+// handleDataChannelSend is the actual handler logic (shared by both routes)
+func (s *httpServer) handleDataChannelSend(ctx *gin.Context, pathName string) {
+	s.parent.Log(logger.Info, "[DataChannel-API] Send request for path: %s", pathName)
+	
+	// Parse JSON command from body
+	var cmd map[string]interface{}
+	if err := ctx.BindJSON(&cmd); err != nil {
+		s.parent.Log(logger.Warn, "[DataChannel-API] Invalid JSON: %v", err)
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid JSON",
+			"details": err.Error(),
+		})
+		return
+	}
+	
+	s.parent.Log(logger.Info, "[DataChannel-API] Command: %+v", cmd)
+	
+	// Get active session for this path
+	sess := GetActiveSession(pathName)
+	if sess == nil {
+		s.parent.Log(logger.Warn, "[DataChannel-API] No active session for path: %s", pathName)
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"error": "Session not found",
+			"path": pathName,
+			"hint": "Trigger camera first: POST /v3/webrtc/fpt/trigger?serial=...",
+			"active_sessions": ListActiveSessions(),
+		})
+		return
+	}
+	
+	s.parent.Log(logger.Info, "[DataChannel-API] Found session: %s", sess.GetSessionID())
+	
+	// Get PeerConnection from session
+	sess.mutex.RLock()
+	pc := sess.pc
+	sess.mutex.RUnlock()
+	
+	if pc == nil {
+		s.parent.Log(logger.Warn, "[DataChannel-API] PeerConnection not ready")
+		ctx.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "PeerConnection not ready",
+			"status": "Wait for connection to establish",
+		})
+		return
+	}
+	
+	// Check if DataChannel is ready
+	if !pc.HasDataChannel() {
+		s.parent.Log(logger.Warn, "[DataChannel-API] DataChannel not available yet")
+		ctx.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "DataChannel not available",
+			"status": "Wait for DataChannel to open (usually 2-3 seconds after trigger)",
+		})
+		return
+	}
+	
+	// Marshal command to JSON
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		s.parent.Log(logger.Error, "[DataChannel-API] JSON marshal failed: %v", err)
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to marshal JSON",
+		})
+		return
+	}
+	
+	s.parent.Log(logger.Info, "[DataChannel-API] Sending to DataChannel: %s", string(data))
+	
+	// Send via DataChannel
+	err = pc.SendDataChannelMessage(data, true) // true = text message
+	if err != nil {
+		s.parent.Log(logger.Error, "[DataChannel-API] Send failed: %v", err)
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to send message",
+			"details": err.Error(),
+		})
+		return
+	}
+	
+	s.parent.Log(logger.Info, "[DataChannel-API] Command sent successfully")
+	
+	// Return success
+	ctx.JSON(http.StatusOK, gin.H{
+		"status": "sent",
+		"command": cmd,
+		"path": pathName,
+		"session_id": sess.GetSessionID().String(),
+		"timestamp": time.Now().Unix(),
+	})
 }

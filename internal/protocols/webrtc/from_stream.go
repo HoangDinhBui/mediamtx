@@ -653,6 +653,12 @@ func FromStream(
 		return err
 	}
 
+	for _, track := range pc.OutgoingTracks {
+		if err := track.setup(pc); err != nil {
+			return err
+		}
+	}
+
 	if videoFormat == nil && audioFormat == nil {
 		return errNoSupportedCodecsFrom
 	}

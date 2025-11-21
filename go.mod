@@ -15,6 +15,7 @@ require (
 	github.com/bluenviron/gortsplib/v5 v5.1.1
 	github.com/bluenviron/mediacommon/v2 v2.5.1
 	github.com/datarhei/gosrt v0.9.0
+	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gin-contrib/pprof v1.5.3
 	github.com/gin-gonic/gin v1.11.0
@@ -24,6 +25,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gookit/color v1.6.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/joho/godotenv v1.5.1
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/matthewhartstonge/argon2 v1.4.1
 	github.com/minio/selfupdate v0.6.0
