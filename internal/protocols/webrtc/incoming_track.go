@@ -246,6 +246,9 @@ type IncomingTrack struct {
 	packetsLost *counterdumper.CounterDumper
 	rtpReceiver *rtpreceiver.Receiver
 
+	payloadMaxSize    int
+    fragmentChunkSize int
+
 	seqRewriter struct {
 		enabled       bool
 		nextOutSeq    uint16
@@ -285,7 +288,8 @@ func (t *IncomingTrack) fragmentSingleNAL(pkt *rtp.Packet) []*rtp.Packet {
 	nalNRI := nalHeader & 0x60  // Extract NRI bits (priority)
 	
 	payload := pkt.Payload[1:]  // Skip NAL header
-	maxChunkSize := 1198        // 1200 - 2 bytes for FU headers
+	// maxChunkSize := 1198        // 1200 - 2 bytes for FU headers
+	maxChunkSize := t.fragmentChunkSize
 	
 	numChunks := (len(payload) + maxChunkSize - 1) / maxChunkSize
 	fragments := make([]*rtp.Packet, numChunks)
@@ -354,7 +358,8 @@ func (t *IncomingTrack) refragmentFUA(pkt *rtp.Packet) []*rtp.Packet {
 	nalType := fuHeader & 0x1F
 	
 	payload := pkt.Payload[2:]
-	maxChunkSize := 1198
+	// maxChunkSize := 1198
+	maxChunkSize := t.fragmentChunkSize
 	
 	numChunks := (len(payload) + maxChunkSize - 1) / maxChunkSize
 	fragments := make([]*rtp.Packet, numChunks)
@@ -538,11 +543,11 @@ func (t *IncomingTrack) start() {
 			// VALIDATION 1: Packet Size (MTU check)
 			// ========================================
 			payloadSize := len(pkt.Payload)
-			if payloadSize > 1200 {
+			if payloadSize > t.payloadMaxSize {
 				oversizedPackets++
-				if isVideo && oversizedPackets <= 5 {
-					t.log.Log(logger.Warn, "[RTP-Validator] OVERSIZED packet #%d: %d bytes (max 1200) - May cause fragmentation!", 
-						totalPackets, payloadSize)
+				// Log reduced to first occurrence only
+				if isVideo && oversizedPackets == 1 {
+					t.log.Log(logger.Warn, "[RTP-Validator] OVERSIZED packets detected (suppressing further logs)")
 				}
 			}
 			
@@ -557,10 +562,7 @@ func (t *IncomingTrack) start() {
 				// Anything > 10000 is suspicious (> 111ms gap)
 				if tsDiff > 10000 && tsDiff < 0xFFFF0000 { // Ignore wraparound
 					timestampJumps++
-					if timestampJumps <= 5 {
-						t.log.Log(logger.Warn, "[RTP-Validator] TIMESTAMP JUMP detected: diff=%d ticks (%.1fms) - Expected ~3000-3600 for 25-30fps",
-							tsDiff, float64(tsDiff)/90.0)
-					}
+					// Timestamp jump logging suppressed to reduce spam
 				}
 			}
 			
@@ -577,14 +579,14 @@ func (t *IncomingTrack) start() {
 						frameCount, pkt.Timestamp, pkt.SequenceNumber, payloadSize)
 				}
 				
-				// Periodic summary every 100 frames
-				if frameCount%100 == 0 {
-					t.log.Log(logger.Info, "[RTP-Validator] Stats after %d frames: Packets=%d, Oversized=%d, TS-Jumps=%d",
+				// Periodic summary reduced frequency to every 1000 frames
+				if frameCount%1000 == 0 {
+					t.log.Log(logger.Debug, "[RTP-Validator] Stats after %d frames: Packets=%d, Oversized=%d, TS-Jumps=%d",
 						frameCount, totalPackets, oversizedPackets, timestampJumps)
 					
 					// Sequence rewriter stats
 					if t.seqRewriter.enabled {
-						t.log.Log(logger.Info, "[SeqRewriter] Stats: PacketsOut=%d, FragmentsCreated=%d",
+						t.log.Log(logger.Debug, "[SeqRewriter] Stats: PacketsOut=%d, FragmentsCreated=%d",
 							t.seqRewriter.packetsOut, t.seqRewriter.fragmentsOut)
 					}
 				}
@@ -636,8 +638,10 @@ func (t *IncomingTrack) start() {
 					if gap < 0 {
 						gap += 65536 // Handle wraparound
 					}
-					if gap > 1 && gap < 100 { // Ignore large gaps (likely restart)
-						t.log.Log(logger.Warn, "[RTP-Validator] SEQUENCE GAP: Expected %d, got %d (gap=%d packets)",
+					// SEQUENCE GAP logging disabled to reduce spam
+					// Only log significant gaps (>20 packets)
+					if gap > 20 && gap < 100 {
+						t.log.Log(logger.Warn, "[RTP-Validator] LARGE SEQUENCE GAP: Expected %d, got %d (gap=%d packets)",
 							expectedSeq, pkt.SequenceNumber, gap)
 					}
 				}
@@ -663,15 +667,21 @@ func (t *IncomingTrack) start() {
 			// SEQUENCE REWRITER: Handle ALL packets
 			// ========================================
 			var packetsToForward []*rtp.Packet
-			
-			if isVideo && len(pkt.Payload) > 1200 {
-				// Oversized packet - needs fragmentation
+			// CRITICAL FIX: Never fragment SPS/PPS/IDR frames!
+			// These are critical for decoder initialization and keyframe decoding
+			var bypassFragmentation bool
+			if isVideo && len(pkt.Payload) > 0 {
+				nalType := pkt.Payload[0] & 0x1F
+				// NAL types 5 (IDR), 7 (SPS), 8 (PPS) must NOT be fragmented
+				bypassFragmentation = (nalType == 5 || nalType == 7 || nalType == 8)
+			}
+			if isVideo && len(pkt.Payload) > t.payloadMaxSize && !bypassFragmentation {
+				// Oversized packet - needs fragmentation (except critical NAL types)
 				oversizedPackets++
 				
-				if oversizedPackets <= 5 {
-					nalType := pkt.Payload[0] & 0x1F
-					t.log.Log(logger.Info, "[SeqRewriter] Oversized packet #%d: %d bytes, NAL type=%d",
-						oversizedPackets, len(pkt.Payload), nalType)
+				// Oversized packet logging suppressed
+				if oversizedPackets == 1 {
+					t.log.Log(logger.Debug, "[SeqRewriter] Oversized packets detected (logs suppressed)")
 				}
 				
 				// Check NAL type
@@ -687,11 +697,10 @@ func (t *IncomingTrack) start() {
 					t.seqRewriter.fragmentsOut += uint64(len(packetsToForward))
 				}
 				
-				if oversizedPackets <= 5 {
-					t.log.Log(logger.Info, "[SeqRewriter]   → Created %d fragments", len(packetsToForward))
-				}
+				// Fragment creation logging suppressed
 			} else {
-				// Normal-sized packet - forward as single packet
+				// Normal-sized packet OR critical frame type - forward as-is
+				// This includes SPS/PPS/IDR which must NEVER be fragmented
 				packetsToForward = []*rtp.Packet{pkt}
 			}
 			

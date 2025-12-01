@@ -27,7 +27,7 @@ func TestFromStreamNoSupportedCodecs(t *testing.T) {
 		}),
 	}
 
-	err := FromStream(desc, r, nil)
+	err := FromStream(desc, r, nil, 1188)
 	require.Equal(t, errNoSupportedCodecsFrom, err)
 }
 
@@ -57,7 +57,7 @@ func TestFromStreamSkipUnsupportedTracks(t *testing.T) {
 
 	pc := &PeerConnection{}
 
-	err := FromStream(desc, r, pc)
+	err := FromStream(desc, r, pc, 1188)
 	require.NoError(t, err)
 
 	require.Equal(t, 1, n)
@@ -75,7 +75,7 @@ func TestFromStream(t *testing.T) {
 			pc := &PeerConnection{}
 			r := &stream.Reader{Parent: test.NilLogger}
 
-			err := FromStream(desc, r, pc)
+			err := FromStream(desc, r, pc, 1188)
 			require.NoError(t, err)
 
 			require.Equal(t, ca.webrtcCaps, pc.OutgoingTracks[0].Caps)
@@ -124,7 +124,7 @@ func TestFromStreamResampleOpus(t *testing.T) {
 
 	r := &stream.Reader{Parent: nil}
 
-	err = FromStream(strm.Desc, r, pc2)
+	err = FromStream(strm.Desc, r, pc2, 1188)
 	require.NoError(t, err)
 
 	err = pc2.Start()

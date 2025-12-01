@@ -186,6 +186,9 @@ type PeerConnection struct {
 	OnDataChannelFunc  func(dc *webrtc.DataChannel)
 
 	CameraSerial string
+	// Derived payload sizes for RTP handling
+	PayloadMaxSize    int
+	FragmentChunkSize int
 }
 
 // Start starts the peer connection.
@@ -1842,6 +1845,8 @@ func (co *PeerConnection) GatherIncomingTracks() error {
 				receiver:  pair.receiver,
 				writeRTCP: co.wr.WriteRTCP,
 				log:       co.Log,
+				payloadMaxSize:    co.PayloadMaxSize,
+				fragmentChunkSize: co.FragmentChunkSize,
 			}
 			t.initialize()
 			co.incomingTracks = append(co.incomingTracks, t)

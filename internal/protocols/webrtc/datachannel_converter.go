@@ -16,16 +16,18 @@ type DataChannelToRTPConverter struct {
 	videoSeqNum    uint16
 	videoTimestamp uint32
 	videoSSRC      uint32
+	payloadMaxSize int
 	
 	mu  sync.Mutex
 	log logger.Writer
 }
 
 // NewDataChannelToRTPConverter creates a new converter instance
-func NewDataChannelToRTPConverter(log logger.Writer) *DataChannelToRTPConverter {
+func NewDataChannelToRTPConverter(log logger.Writer, payloadMaxSize int) *DataChannelToRTPConverter {
 	return &DataChannelToRTPConverter{
 		videoSSRC: 1234, // Match camera SSRC if possible
 		log:       log,
+		payloadMaxSize: payloadMaxSize,
 	}
 }
 
@@ -55,9 +57,9 @@ func (c *DataChannelToRTPConverter) ProcessH264Chunk(data []byte) error {
 	c.log.Log(logger.Debug, "[Converter] NAL type %d, size %d bytes", nalType, len(nalUnit))
 	
 	// Fragment large NAL units (MTU = 1200 bytes)
-	const maxPayloadSize = 1200
+	// const maxPayloadSize = 1200
 	
-	if len(nalUnit) <= maxPayloadSize {
+	if len(nalUnit) <= c.payloadMaxSize {
 		// Single NAL unit packet
 		return c.sendRTPPacket(nalUnit)
 	}
@@ -94,7 +96,7 @@ func (c *DataChannelToRTPConverter) sendRTPPacket(payload []byte) error {
 
 // fragmentNALUnit splits large NAL units into FU-A fragments
 func (c *DataChannelToRTPConverter) fragmentNALUnit(nalUnit []byte, nalType byte) error {
-	const maxFragmentSize = 1200
+	maxFragmentSize := c.payloadMaxSize
 	
 	nalHeader := nalUnit[0]
 	nalPayload := nalUnit[1:]

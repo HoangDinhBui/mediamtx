@@ -598,6 +598,7 @@ func (p *Core) createResources(initial bool) error {
 			ReadTimeout:           p.conf.ReadTimeout,
 			WriteTimeout:          p.conf.WriteTimeout,
 			UDPReadBufferSize:     p.conf.UDPReadBufferSize,
+			UDPMaxPayloadSize:     p.conf.UDPMaxPayloadSize,
 			LocalUDPAddress:       p.conf.WebRTCLocalUDPAddress,
 			LocalTCPAddress:       p.conf.WebRTCLocalTCPAddress,
 			IPsFromInterfaces:     p.conf.WebRTCIPsFromInterfaces,
@@ -1027,4 +1028,18 @@ func (p *Core) APIConfigSet(conf *conf.Conf) {
 	case p.chAPIConfigSet <- conf:
 	case <-p.ctx.Done():
 	}
+}
+
+// getWebRTCPayloadMaxSize calculates the max payload size for WebRTC RTP packets.
+// This is used by encoders when creating RTP packets.
+func getWebRTCPayloadMaxSize(udpMaxPayloadSize int) int {
+	// UDP max payload size - 12 (RTP header)
+	// Conservative: ensure total packet <= udpMaxPayloadSize
+	return udpMaxPayloadSize - 12
+}
+// getWebRTCFragmentChunkSize calculates the max chunk size for FU-A fragmentation.
+// This is used when re-fragmenting oversized packets.
+func getWebRTCFragmentChunkSize(udpMaxPayloadSize int) int {
+	// UDP max payload size - 12 (RTP header) - 2 (FU-A headers)
+	return udpMaxPayloadSize - 14
 }

@@ -24,9 +24,9 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-const (
-	webrtcPayloadMaxSize = 1188 // 1200 - 12 (RTP header)
-)
+// const (
+// 	webrtcPayloadMaxSize = 1188 // 1200 - 12 (RTP header)
+// )
 
 var multichannelOpusSDP = map[int]string{
 	3: "channel_mapping=0,2,1;num_streams=2;coupled_streams=1",
@@ -68,6 +68,7 @@ func setupVideoTrack(
 	desc *description.Session,
 	r *stream.Reader,
 	pc *PeerConnection,
+	payloadMaxSize int,
 ) (format.Format, error) {
 	var av1Format *format.AV1
 	media := desc.FindFormat(&av1Format)
@@ -83,7 +84,7 @@ func setupVideoTrack(
 
 		encoder := &rtpav1.Encoder{
 			PayloadType:    105,
-			PayloadMaxSize: webrtcPayloadMaxSize,
+			PayloadMaxSize: payloadMaxSize,
 		}
 		err := encoder.Init()
 		if err != nil {
@@ -130,7 +131,7 @@ func setupVideoTrack(
 
 		encoder := &rtpvp9.Encoder{
 			PayloadType:      96,
-			PayloadMaxSize:   webrtcPayloadMaxSize,
+			PayloadMaxSize:   payloadMaxSize,
 			InitialPictureID: ptrOf(uint16(8445)),
 		}
 		err := encoder.Init()
@@ -177,7 +178,7 @@ func setupVideoTrack(
 
 		encoder := &rtpvp8.Encoder{
 			PayloadType:    96,
-			PayloadMaxSize: webrtcPayloadMaxSize,
+			PayloadMaxSize: payloadMaxSize,
 		}
 		err := encoder.Init()
 		if err != nil {
@@ -224,7 +225,7 @@ func setupVideoTrack(
 
 		encoder := &rtph265.Encoder{
 			PayloadType:    96,
-			PayloadMaxSize: webrtcPayloadMaxSize,
+			PayloadMaxSize: payloadMaxSize,
 		}
 		err := encoder.Init()
 		if err != nil {
@@ -281,7 +282,7 @@ func setupVideoTrack(
 
 		encoder := &rtph264.Encoder{
 			PayloadType:    96,
-			PayloadMaxSize: webrtcPayloadMaxSize,
+			PayloadMaxSize: payloadMaxSize,
 		}
 		err := encoder.Init()
 		if err != nil {
@@ -333,6 +334,7 @@ func setupAudioTrack(
 	desc *description.Session,
 	r *stream.Reader,
 	pc *PeerConnection,
+	payloadMaxSize int,
 ) (format.Format, error) {
 	var opusFormat *format.Opus
 	media := desc.FindFormat(&opusFormat)
@@ -517,7 +519,7 @@ func setupAudioTrack(
 		} else {
 			encoder := &rtplpcm.Encoder{
 				PayloadType:    96,
-				PayloadMaxSize: webrtcPayloadMaxSize,
+				PayloadMaxSize: payloadMaxSize,
 				BitDepth:       16,
 				ChannelCount:   g711Format.ChannelCount,
 			}
@@ -605,7 +607,7 @@ func setupAudioTrack(
 			PayloadType:    96,
 			BitDepth:       16,
 			ChannelCount:   lpcmFormat.ChannelCount,
-			PayloadMaxSize: webrtcPayloadMaxSize,
+			PayloadMaxSize: payloadMaxSize,
 		}
 		err := encoder.Init()
 		if err != nil {
@@ -655,13 +657,14 @@ func FromStream(
 	desc *description.Session,
 	r *stream.Reader,
 	pc *PeerConnection,
+	payloadMaxSize int,
 ) error {
-	videoFormat, err := setupVideoTrack(desc, r, pc)
+	videoFormat, err := setupVideoTrack(desc, r, pc, payloadMaxSize)
 	if err != nil {
 		return err
 	}
 
-	audioFormat, err := setupAudioTrack(desc, r, pc)
+	audioFormat, err := setupAudioTrack(desc, r, pc, payloadMaxSize)
 	if err != nil {
 		return err
 	}
@@ -735,7 +738,7 @@ func RequestKeyframe(pc *PeerConnection, track *OutgoingTrack) {
         time.Sleep(200 * time.Millisecond)
 
         // Send periodic keyframe requests (every 2 seconds) to combat packet loss
-        ticker := time.NewTicker(2 * time.Second)
+        ticker := time.NewTicker(1 * time.Second)
         defer ticker.Stop()
 
         requestCount := 0

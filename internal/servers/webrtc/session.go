@@ -96,6 +96,9 @@ type sessionParent interface {
 
 type session struct {
 	udpReadBufferSize     uint
+	udpMaxPayloadSize     int
+	payloadMaxSize        int
+	fragmentChunkSize     int
 	parentCtx             context.Context
 	ipsFromInterfaces     bool
 	ipsFromInterfacesList []string
@@ -125,21 +128,17 @@ type session struct {
 	answerMu sync.Mutex
     answer   []byte
 
-	// NEW: Store incoming tracks for recording
 	incomingVideoTrack *pwebrtc.TrackRemote
 	trackMutex         sync.RWMutex
 
-	// NEW: WebSocket relay for DataChannel messages
 	wsRelay *WebSocketDataChannelRelay
 
-	// NEW: DataChannel-to-RTP converter
     dcConverter *webrtc.DataChannelToRTPConverter
 
 	chunkQueue chan []byte
     queueWg    sync.WaitGroup
 	queueRunning bool
 }
-
 
 
 func (s *session) initialize() {
@@ -264,7 +263,7 @@ func (s *session) runPublish() (int, error) {
 		creds = httpp.Credentials(s.req.httpRequest)
 	}
 
-	// 1. FIND PATH CONFIGURATION
+	// 1. FIND PATH CONFIGURATION 
 	pathConf, err := s.pathManager.FindPathConf(defs.PathFindPathConfReq{
 		AccessRequest: defs.PathAccessRequest{
 			Name:        s.req.pathName,
@@ -300,6 +299,8 @@ func (s *session) runPublish() (int, error) {
 		Publish:               true,
 		Log:                   s,
 		CameraSerial: extractSerialFromPath(s.req.pathName),
+		PayloadMaxSize:    s.payloadMaxSize,
+		FragmentChunkSize: s.fragmentChunkSize,
 	}
 	
 	// REMOVED: Trickle ICE disabled - all candidates bundled in answer SDP
@@ -663,7 +664,7 @@ connectionEstablished:
 	s.Log(logger.Info, "[DataChannel] Async processor started (buffer: 500 chunks)")
 
 	// Initialize AND START converter
-	s.dcConverter = webrtc.NewDataChannelToRTPConverter(s)
+	s.dcConverter = webrtc.NewDataChannelToRTPConverter(s, s.payloadMaxSize)
 
 	// Setup converter to handle incoming binary chunks
 	// Setup NON-BLOCKING DataChannel handler
@@ -923,7 +924,8 @@ func (s *session) runRead() (int, error) {
 		return http.StatusBadRequest, err
 	}
 
-	err = webrtc.FromStream(strm.Desc, r, pc)
+	payloadMax := s.udpMaxPayloadSize - 12
+	err = webrtc.FromStream(strm.Desc, r, pc, payloadMax)
 	if err != nil {
 		return http.StatusBadRequest, err
 	}

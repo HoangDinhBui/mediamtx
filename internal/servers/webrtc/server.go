@@ -215,6 +215,7 @@ type Server struct {
 	ReadTimeout           conf.Duration
 	WriteTimeout          conf.Duration
 	UDPReadBufferSize     uint
+	UDPMaxPayloadSize     int
 	LocalUDPAddress       string
 	LocalTCPAddress       string
 	IPsFromInterfaces     bool
@@ -816,6 +817,7 @@ outer:
 		case req := <-s.chNewSession:
 			sx := &session{
 				udpReadBufferSize:     s.UDPReadBufferSize,
+				udpMaxPayloadSize:     s.UDPMaxPayloadSize,
 				parentCtx:             s.ctx,
 				ipsFromInterfaces:     s.IPsFromInterfaces,
 				ipsFromInterfacesList: s.IPsFromInterfacesList,
@@ -830,6 +832,8 @@ outer:
 				externalCmdPool:       s.ExternalCmdPool,
 				pathManager:           s.PathManager,
 				parent:                s,
+				payloadMaxSize:    s.UDPMaxPayloadSize,
+				fragmentChunkSize: s.UDPMaxPayloadSize - 14,
 			}
 			sx.initialize()
 			s.sessions[sx] = struct{}{}
