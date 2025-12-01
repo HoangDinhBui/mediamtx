@@ -19,6 +19,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/stream"
 	"github.com/bluenviron/mediamtx/internal/unit"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
@@ -306,20 +307,23 @@ func setupVideoTrack(
 				lastPTS = u.PTS
 
 				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadH264))
-				if err2 != nil {
-					return nil //nolint:nilerr
-				}
+			if err2 != nil {
+				return nil //nolint:nilerr
+			}
 
-				for _, pkt := range packets {
-					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
-					pkt.Timestamp += u.RTPPackets[0].Timestamp
-					track.WriteRTPWithNTP(pkt, ntp.Add(-1*time.Minute)) //nolint:errcheck
-				}
+			for _, pkt := range packets {
+				ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
+				pkt.Timestamp += u.RTPPackets[0].Timestamp
+				// if pkt.PayloadType != 96 {
+				// 	pkt.PayloadType = 96 // Browser-compatible PT
+				// }
+				track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
+			}
 
-				return nil
-			})
+			return nil
+		})
 
-		return h264Format, nil
+	return h264Format, nil
 	}
 
 	return nil, nil
@@ -668,6 +672,25 @@ func FromStream(
 		}
 	}
 
+	for i, track := range pc.OutgoingTracks {
+		var trackID string
+		if track.isVideo() {
+			trackID = fmt.Sprintf("video-%d", i)
+		} else {
+			trackID = fmt.Sprintf("audio-%d", i)
+		}
+		
+		// Note: This will work once PeerConnection has LocalDescription set
+		// In WHEP flow, this happens after CreateFullAnswer()
+		track.SetNegotiatedPT(pc, trackID)
+	}
+
+	for _, track := range pc.OutgoingTracks {
+		if track.isVideo() {
+			RequestKeyframe(pc, track)
+		}
+	}
+
 	if videoFormat == nil && audioFormat == nil {
 		return errNoSupportedCodecsFrom
 	}
@@ -683,4 +706,61 @@ func FromStream(
 	}
 
 	return nil
+}
+
+// RequestKeyframe sends periodic PLI requests to combat packet loss
+func RequestKeyframe(pc *PeerConnection, track *OutgoingTrack) {
+    if !track.isVideo() {
+        return
+    }
+
+    go func() {
+        // Wait for DTLS connection to be ready (max 5 seconds)
+        ready := false
+        for i := 0; i < 50; i++ {
+            if pc.wr != nil && pc.wr.ConnectionState() == webrtc.PeerConnectionStateConnected {
+                ready = true
+                pc.Log.Log(logger.Info, "[WHEP] Connection ready, starting periodic keyframe requests...")
+                break
+            }
+            time.Sleep(100 * time.Millisecond)
+        }
+
+        if !ready {
+            pc.Log.Log(logger.Warn, "[WHEP] Timeout waiting for connection, skipping keyframe request")
+            return
+        }
+
+        // Additional small delay to ensure DTLS is fully ready
+        time.Sleep(200 * time.Millisecond)
+
+        // Send periodic keyframe requests (every 2 seconds) to combat packet loss
+        ticker := time.NewTicker(2 * time.Second)
+        defer ticker.Stop()
+
+        requestCount := 0
+        for range ticker.C {
+            // Check if connection is still active
+            if pc.wr == nil || pc.wr.ConnectionState() != webrtc.PeerConnectionStateConnected {
+                pc.Log.Log(logger.Info, "[WHEP] Connection closed, stopping periodic keyframe requests")
+                return
+            }
+
+            // Send PLI (Picture Loss Indication) request
+            pli := &rtcp.PictureLossIndication{
+                MediaSSRC: track.ssrc,
+            }
+
+            if err := pc.wr.WriteRTCP([]rtcp.Packet{pli}); err == nil {
+                requestCount++
+                if requestCount <= 5 {
+                    pc.Log.Log(logger.Info, "[WHEP] Keyframe request #%d sent (combat packet loss)", requestCount)
+                } else if requestCount == 10 {
+                    pc.Log.Log(logger.Info, "[WHEP] Periodic keyframe requests active (suppressing further logs)")
+                }
+            } else {
+                pc.Log.Log(logger.Warn, "[WHEP] Failed to send keyframe request: %v", err)
+            }
+        }
+    }()
 }

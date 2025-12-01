@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+
 	"github.com/gin-gonic/gin"
 
 	// "net/url"
@@ -616,8 +617,9 @@ func (s *Server) Initialize() error {
 	}
 
 	// ========================================================================
-	// TURN/STUN CONFIGURATION
+	// TURN/STUN CONFIGURATION (DISABLED BY USER)
 	// ========================================================================
+	/*
 	turnURL := os.Getenv("TURN_SERVER_URL")
 	if turnURL == "" {
 		turnURL = "turn:turn-connect.fcam.vn:3478"  // Default FPT TURN
@@ -672,6 +674,7 @@ func (s *Server) Initialize() error {
 			s.Log(logger.Info, "  [%d] %s", i+1, srv.URL)
 		}
 	}
+	*/
 
 	// ========================================================================
 	// PUBLIC IP CONFIGURATION
@@ -1291,4 +1294,57 @@ func (s *httpServer) handleDataChannelSend(ctx *gin.Context, pathName string) {
 		"session_id": sess.GetSessionID().String(),
 		"timestamp": time.Now().Unix(),
 	})
+}
+
+// APIStreamStatus checks if stream is ready for WHEP
+func (s *Server) APIStreamStatus(w http.ResponseWriter, r *http.Request) {
+    pathName := strings.TrimPrefix(r.URL.Path, "/v3/webrtc/")
+    pathName = strings.TrimSuffix(pathName, "/status")
+    
+    s.Log(logger.Info, "[Stream-Status] Checking: %s", pathName)
+    
+    sess := GetActiveSession(pathName)
+    if sess == nil {
+        http.Error(w, "Session not found", http.StatusNotFound)
+        return
+    }
+    
+    // Check if session is publishing and has active stream
+    if !sess.IsPublishing() {
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "ready": false,
+            "reason": "Session created but not publishing yet",
+            "path": pathName,
+        })
+        return
+    }
+    
+    // Check if PeerConnection exists and is connected
+    sess.mutex.RLock()
+    pc := sess.pc
+    sess.mutex.RUnlock()
+    
+    if pc == nil {
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "ready": false,
+            "reason": "PeerConnection not initialized",
+            "path": pathName,
+        })
+        return
+    }
+    
+    iceState := pc.WebRTCConnection().ICEConnectionState()
+    connState := pc.WebRTCConnection().ConnectionState()
+    
+    ready := (iceState == pwebrtc.ICEConnectionStateConnected || 
+              iceState == pwebrtc.ICEConnectionStateCompleted) &&
+             connState == pwebrtc.PeerConnectionStateConnected
+    
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "ready": ready,
+        "ice_state": iceState.String(),
+        "connection_state": connState.String(),
+        "path": pathName,
+        "session_id": sess.GetSessionID().String(),
+    })
 }

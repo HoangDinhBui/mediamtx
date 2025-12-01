@@ -134,6 +134,10 @@ type session struct {
 
 	// NEW: DataChannel-to-RTP converter
     dcConverter *webrtc.DataChannelToRTPConverter
+
+	chunkQueue chan []byte
+    queueWg    sync.WaitGroup
+	queueRunning bool
 }
 
 
@@ -615,15 +619,59 @@ connectionEstablished:
 
 	s.Log(logger.Info, "[DataChannel] Ready! Now starting converter...")
 
+	// ========================================================================
+	// ASYNC DATACHANNEL PROCESSOR
+	// ========================================================================
+	s.Log(logger.Info, "[DataChannel] Starting async chunk processor...")
+
+	// Create buffered channel for chunks (buffer 100 chunks = ~1-2 seconds)
+	s.chunkQueue = make(chan []byte, 500)
+	s.queueRunning = true
+
+	// Start async processor goroutine
+	s.queueWg.Add(1)
+	go func() {
+		defer s.queueWg.Done()
+		
+		chunkCount := 0
+		droppedCount := 0
+		
+		for chunk := range s.chunkQueue {
+			chunkCount++
+			
+			// 1. Convert H.264 chunk → RTP packets
+			if s.dcConverter != nil {
+				if err := s.dcConverter.ProcessH264Chunk(chunk); err != nil {
+					s.Log(logger.Warn, "[Converter] Failed chunk #%d: %v", chunkCount, err)
+				}
+			}
+			
+			// 2. Broadcast to WebSocket clients
+			if s.wsRelay != nil {
+				s.wsRelay.BroadcastDataChannelMessage(false, chunk)
+			}
+			
+			// Log progress every 60 chunks
+			if chunkCount%60 == 0 {
+				s.Log(logger.Debug, "[Async] Processed %d chunks (dropped: %d)", chunkCount, droppedCount)
+			}
+		}
+		
+		s.Log(logger.Info, "[Async] Processor stopped. Total processed: %d chunks", chunkCount)
+	}()
+
+	s.Log(logger.Info, "[DataChannel] Async processor started (buffer: 500 chunks)")
+
 	// Initialize AND START converter
 	s.dcConverter = webrtc.NewDataChannelToRTPConverter(s)
 
 	// Setup converter to handle incoming binary chunks
+	// Setup NON-BLOCKING DataChannel handler
 	pc.OnDataChannelMessageFunc = func(isText bool, data []byte) {
 		if isText {
+			// Handle text messages immediately (commands/responses)
 			s.Log(logger.Debug, "[DataChannel] Text: %s", string(data))
 			
-			// Relay to WebSocket if available
 			if s.wsRelay != nil {
 				s.wsRelay.BroadcastDataChannelMessage(true, data)
 			}
@@ -631,18 +679,18 @@ connectionEstablished:
 		}
 		
 		// Binary data = H.264 chunk from camera
-		s.Log(logger.Debug, "[DataChannel] Binary chunk: %d bytes", len(data))
-		
-		// Convert H.264 chunk → RTP packets
-		if s.dcConverter != nil {
-			if err := s.dcConverter.ProcessH264Chunk(data); err != nil {
-				s.Log(logger.Warn, "[Converter] Failed: %v", err)
+		// Queue for async processing (NON-BLOCKING!)
+		if s.queueRunning {
+			select {
+			case s.chunkQueue <- data:
+				// Successfully queued - handler returns immediately
+				
+			default:
+				// Queue full - drop chunk and log warning
+				s.Log(logger.Warn, "[DataChannel] Queue FULL! Dropping chunk (%d bytes) - increase buffer or optimize processing", len(data))
 			}
-		}
-		
-		// Relay to WebSocket if available
-		if s.wsRelay != nil {
-			s.wsRelay.BroadcastDataChannelMessage(false, data)
+		} else {
+			s.Log(logger.Warn, "[DataChannel] Processor not running, chunk dropped")
 		}
 	}
 
@@ -736,6 +784,19 @@ connectionEstablished:
 	// Register session for ICE handling
 	RegisterSession(s.req.pathName, s)
 	defer UnregisterSession(s.req.pathName)
+
+	// Cleanup async processor on exit
+	defer func() {
+		if s.queueRunning {
+			s.Log(logger.Info, "[DataChannel] Stopping async processor...")
+			s.queueRunning = false
+			
+			close(s.chunkQueue)
+			s.queueWg.Wait()
+			
+			s.Log(logger.Info, "[DataChannel] Async processor stopped cleanly")
+		}
+	}()
 
 	// Create WebSocket relay if MQTT mode
 	isMQTTSession := s.req.httpRequest == nil && s.req.answerCh != nil

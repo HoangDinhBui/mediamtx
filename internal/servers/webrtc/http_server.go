@@ -20,6 +20,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/httpp"
 	"github.com/bluenviron/mediamtx/internal/protocols/whip"
+	pwebrtc "github.com/pion/webrtc/v4"
 )
 
 //go:embed publish_index.html
@@ -110,6 +111,8 @@ func (s *httpServer) initialize() error {
 	router.POST("/v3/webrtc/fpt/trigger", s.wrapHandler(s.parent.APITriggerFPTStream))
 	router.GET("/v3/webrtc/fpt/cameras", s.wrapHandler(s.parent.APIListFPTCameras))
 	router.GET("/v3/webrtc/fpt/datachannel", s.wrapHandler(s.parent.APITestDataChannel))
+	router.GET("/v3/webrtc/:path/:subpath/status", s.onStreamStatus)
+	// router.GET("/v3/webrtc/:path/status", s.onStreamStatusSingle)
 	
 	router.POST("/v3/webrtc/:path/:subpath/datachannel/send", s.onDataChannelSendWithSubpath)
 	router.POST("/v3/webrtc/:path/datachannel/send", s.onDataChannelSend)
@@ -425,4 +428,42 @@ func (s *httpServer) onRequest(ctx *gin.Context) {
 		}
 		return
 	}
+}
+
+func (s *httpServer) onStreamStatus(ctx *gin.Context) {
+    path := ctx.Param("path")
+    subpath := ctx.Param("subpath")
+    fullPath := path + "/" + subpath
+    
+    sess := GetActiveSession(fullPath)
+    if sess == nil {
+        ctx.JSON(http.StatusNotFound, gin.H{
+            "ready": false,
+            "reason": "Session not found",
+        })
+        return
+    }
+    
+    sess.mutex.RLock()
+    pc := sess.pc
+    sess.mutex.RUnlock()
+    
+    if pc == nil {
+        ctx.JSON(http.StatusOK, gin.H{
+            "ready": false,
+            "reason": "PeerConnection initializing",
+        })
+        return
+    }
+    
+    iceState := pc.WebRTCConnection().ICEConnectionState()
+    
+    ready := (iceState == pwebrtc.ICEConnectionStateConnected || 
+              iceState == pwebrtc.ICEConnectionStateCompleted)
+    
+    ctx.JSON(http.StatusOK, gin.H{
+        "ready": ready,
+        "ice_state": iceState.String(),
+        "path": fullPath,
+    })
 }

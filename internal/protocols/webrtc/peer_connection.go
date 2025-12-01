@@ -235,6 +235,11 @@ func (co *PeerConnection) Start() error {
 					MimeType:    webrtc.MimeTypeH264,
 					ClockRate:   90000,
 					SDPFmtpLine: "profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1",
+					RTCPFeedback: []webrtc.RTCPFeedback{
+						{Type: "nack"},
+						{Type: "nack", Parameter: "pli"},
+						{Type: "goog-remb"},
+					},
 				},
 				PayloadType: 102,
 			}, webrtc.RTPCodecTypeVideo)
@@ -386,7 +391,7 @@ func (co *PeerConnection) Start() error {
 		webrtc.WithMediaEngine(mediaEngine),
 		webrtc.WithInterceptorRegistry(interceptorRegistry))
 
-	// SOLUTION 2E: ENABLE TURN RELAY FOR NAT TRAVERSAL
+	// ENABLE TURN RELAY FOR NAT TRAVERSAL
 	// Use TURN relay when direct SRFLX connection fails
 	// This is necessary when both peers are behind symmetric NAT/firewall
 	co.Log.Log(logger.Info, "[ICE-Config] === SOLUTION 2E: TURN RELAY ENABLED ===")
@@ -509,7 +514,7 @@ func (co *PeerConnection) Start() error {
 		}
 
 		_, err = co.wr.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
-			Direction: webrtc.RTPTransceiverDirectionSendrecv,
+			Direction: webrtc.RTPTransceiverDirectionRecvonly,
 		})
 		if err != nil {
 			co.wr.GracefulClose() //nolint:errcheck
@@ -621,7 +626,7 @@ co.wr.OnDataChannel(func(dc *webrtc.DataChannel) {
 			// Check if message is simple greeting first
 			messageText := string(msg.Data)
 			if strings.Contains(messageText, "Hello from") {
-				co.Log.Log(logger.Info, "[DataChannel] ✓ Camera greeting received!")
+				co.Log.Log(logger.Info, "[DataChannel] Camera greeting received!")
 				co.Log.Log(logger.Info, "[DataChannel] Camera is ready for commands")
 				
 				// Send Stream command after greeting
@@ -980,65 +985,34 @@ func (co *PeerConnection) run() {
 	}
 }
 
-func (co *PeerConnection) removeUnwantedCandidates(firstMedia *sdp.MediaDescription) error {
-	// Count existing candidates FIRST
-	candidateCount := 0
-	for _, attr := range firstMedia.Attributes {
-		if attr.Key == "candidate" {
-			candidateCount++
-		}
-	}
-	
-	// Skip filtering if no candidates (bundled media sections)
-	if candidateCount == 0 {
-		co.Log.Log(logger.Debug, "[ICE-Filter] Skipping media section with 0 candidates (bundled)")
-		return nil
-	}
-	
-	var newAttributes []sdp.Attribute
-	relayCount := 0
-	
-	co.Log.Log(logger.Info, "[ICE-Filter] === FORCING TURN RELAY MODE ===")
-	co.Log.Log(logger.Info, "[ICE-Filter] Camera IP %s is unreachable, using TURN relay only", "21.64.68.193")
-	co.Log.Log(logger.Info, "[ICE-Filter] Processing %d candidates...", candidateCount)
-	
-	for _, attr := range firstMedia.Attributes {
-		if attr.Key == "candidate" {
-			parts := strings.Split(attr.Value, " ")
-			
-			if len(parts) > 7 {
-				candType := parts[7]
-				
-				if candType == "relay" {
-					// ONLY keep RELAY candidates (TURN)
-					newAttributes = append(newAttributes, attr)
-					relayCount++
-					co.Log.Log(logger.Info, "[ICE-Filter] ✓ RELAY kept: %s", attr.Value)
-				} else {
-					co.Log.Log(logger.Debug, "[ICE-Filter] ✗ Filtered out %s candidate", candType)
-				}
-			}
-			continue
-		}
-		
-		newAttributes = append(newAttributes, attr)
-	}
-	
-	co.Log.Log(logger.Info, "[ICE-Filter] Summary: %d RELAY candidates (filtered %d host/srflx)", 
-		relayCount, candidateCount - relayCount)
-	
-	if relayCount == 0 {
-		co.Log.Log(logger.Error, "[ICE-Filter] ERROR: No RELAY candidates available! TURN server may have failed to allocate.")
-		return fmt.Errorf("no TURN relay candidates available")
-	}
-	
-	firstMedia.Attributes = newAttributes
-	
-	co.Log.Log(logger.Info, "[ICE-Filter] === RELAY MODE ENABLED ===")
-	co.Log.Log(logger.Info, "[ICE-Filter] All traffic will route through TURN server 42.116.138.54")
-	
-	return nil
-}
+// func (co *PeerConnection) removeUnwantedCandidates(firstMedia *sdp.MediaDescription) error {
+//     var newAttributes []sdp.Attribute
+//     relayCount := 0
+//     hostCount := 0
+    
+//     for _, attr := range firstMedia.Attributes {
+//         if attr.Key == "candidate" {
+//             parts := strings.Split(attr.Value, " ")
+//             if len(parts) > 7 {
+//                 candType := parts[7]
+                
+//                 // Keep only 1 RELAY + 1 HOST
+//                 if candType == "relay" && relayCount == 0 {
+//                     newAttributes = append(newAttributes, attr)
+//                     relayCount++
+//                 } else if candType == "host" && hostCount == 0 {
+//                     newAttributes = append(newAttributes, attr)
+//                     hostCount++
+//                 }
+//             }
+//             continue
+//         }
+//         newAttributes = append(newAttributes, attr)
+//     }
+    
+//     firstMedia.Attributes = newAttributes
+//     return nil
+// }
 
 func (co *PeerConnection) addAdditionalCandidates(firstMedia *sdp.MediaDescription) error {
 	i := 0
@@ -1119,17 +1093,17 @@ func (co *PeerConnection) filterLocalDescription(desc *webrtc.SessionDescription
 	psdp.Unmarshal([]byte(desc.SDP)) //nolint:errcheck
 
 	// Filter candidates in ALL media descriptions (video, audio, etc.)
-	for _, media := range psdp.MediaDescriptions {
-		err := co.removeUnwantedCandidates(media)
-		if err != nil {
-			return nil, err
-		}
+	// for _, media := range psdp.MediaDescriptions {
+	// 	err := co.removeUnwantedCandidates(media)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
 
-		err = co.addAdditionalCandidates(media)
-		if err != nil {
-			return nil, err
-		}
-	}
+	// 	err = co.addAdditionalCandidates(media)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// }
 
 	out, _ := psdp.Marshal()
 	desc.SDP = string(out)
@@ -1445,15 +1419,86 @@ func (co *PeerConnection) AddRemoteCandidate(candidate *webrtc.ICECandidateInit)
 }
 
 // normalizeOfferCodecs modifies offer to use standard Pion codec payload types
-// This fixes Pion's codec rejection issue with non-standard PT values
 func (co *PeerConnection) normalizeOfferCodecs(offer *webrtc.SessionDescription) *webrtc.SessionDescription {
-	// Keep offer unchanged for now - just ensure it's accepted by Pion
-	// The key is that we already registered H.264 PT 102 and PCMA PT 8
-	// Pion should accept these when we call SetRemoteDescription
-	
-	// Alternative approach: If Pion still rejects, we can remap codecs here
-	// For now, return original offer - the issue might be elsewhere
-	return offer
+	var psdp sdp.SessionDescription
+    err := psdp.Unmarshal([]byte(offer.SDP))
+    if err != nil {
+        co.Log.Log(logger.Warn, "normalizeOfferCodecs: Unmarshal SDP failed: %v", err)
+        return offer
+    }
+
+    for _, media := range psdp.MediaDescriptions {
+		if media.MediaName.Media == "video" {
+			var allowedPTs []string
+			// Tìm các PT hợp lệ (H264 baseline/main)
+			for _, attr := range media.Attributes {
+				if attr.Key == "rtpmap" && strings.Contains(attr.Value, "H264") {
+					pt := strings.Fields(attr.Value)[0]
+					for _, a := range media.Attributes {
+						if a.Key == "fmtp" && strings.HasPrefix(a.Value, pt+" ") {
+							if strings.Contains(a.Value, "profile-level-id=42e0") || strings.Contains(a.Value, "profile-level-id=4d00") {
+								allowedPTs = append(allowedPTs, pt)
+							}
+						}
+					}
+				}
+			}
+			// Sửa dòng m=video chỉ giữ PT hợp lệ
+			var newFormats []string
+			for _, pt := range allowedPTs {
+				newFormats = append(newFormats, pt)
+			}
+			media.MediaName.Formats = newFormats
+			// Lọc lại các thuộc tính chỉ giữ PT hợp lệ
+			var newAttrs []sdp.Attribute
+			for _, attr := range media.Attributes {
+				keep := true
+				// Chỉ giữ các dòng liên quan đến PT hợp lệ
+				if attr.Key == "rtpmap" || attr.Key == "fmtp" || attr.Key == "rtcp-fb" {
+					pt := strings.Fields(attr.Value)[0]
+					found := false
+					for _, allowed := range allowedPTs {
+						if pt == allowed {
+							found = true
+							break
+						}
+					}
+					if !found {
+						keep = false
+					}
+				}
+				// Loại bỏ apt/rtx nếu PT tham chiếu không hợp lệ
+				if attr.Key == "fmtp" && strings.Contains(attr.Value, "apt=") {
+					parts := strings.Split(attr.Value, "apt=")
+					if len(parts) > 1 {
+						aptPT := strings.Fields(parts[1])[0]
+						found := false
+						for _, allowed := range allowedPTs {
+							if aptPT == allowed {
+								found = true
+								break
+							}
+						}
+						if !found {
+							keep = false
+						}
+					}
+				}
+				if keep {
+					newAttrs = append(newAttrs, attr)
+				}
+			}
+			media.Attributes = newAttrs
+		}
+    }
+
+    out, err := psdp.Marshal()
+    if err != nil {
+        co.Log.Log(logger.Warn, "normalizeOfferCodecs: Marshal SDP failed: %v", err)
+        return offer
+    }
+    offer.SDP = string(out)
+    return offer
 }
 
 // CreateFullAnswer creates a full answer.
@@ -1505,11 +1550,11 @@ func (co *PeerConnection) CreateFullAnswer(offer *webrtc.SessionDescription) (*w
 		co.Log.Log(logger.Warn, "[CreateFullAnswer] This might explain why ICE connection fails")
 	}
 	
-	// FIX: Modify offer to ensure Pion accepts codecs
-	// Problem: Pion rejects H.264 PT 102 during SetRemoteDescription
 	// Solution: Normalize offer SDP to use standard payload types
-	modifiedOffer := co.normalizeOfferCodecs(offer)
-	co.Log.Log(logger.Info, "[CreateFullAnswer] Offer modified for codec compatibility")
+	// modifiedOffer := co.normalizeOfferCodecs(offer)
+
+	modifiedOffer := offer
+	co.Log.Log(logger.Info, "[CreateFullAnswer] Using original offer (codec normalization disabled)")
 	
 	err := co.wr.SetRemoteDescription(*modifiedOffer)
 	if err != nil {
@@ -1519,50 +1564,52 @@ func (co *PeerConnection) CreateFullAnswer(offer *webrtc.SessionDescription) (*w
 	
 	co.Log.Log(logger.Info, "[CreateFullAnswer] SetRemoteDescription succeeded")
 	
-	// CRITICAL FIX: Force Pion to create answer with proper ports
-	// Problem: Receiver exists but no incoming track yet - Pion creates answer with port 9 (reject)
-	// Root cause: Pion needs either (1) RTP data to arrive, or (2) outgoing track on transceiver
-	// Solution: Add dummy outgoing tracks to force transceiver activation
-	
-	existingTransceivers := co.wr.GetTransceivers()
-	for i, tr := range existingTransceivers {
-		if tr.Receiver() != nil && tr.Receiver().Track() == nil {
-			mid := tr.Mid()
-			
-			if i == 0 { // Video transceiver
-				co.Log.Log(logger.Info, "[Track-Accept] Video transceiver[0] mid=%s - will add video track to force port != 9", mid)
-				// Use Sender to add outgoing track
-				videoTrack, err := webrtc.NewTrackLocalStaticSample(
-					webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000},
-					"video",
-					"MediaMTXVideo",
-				)
-				if err == nil {
-					_, err = co.wr.AddTrack(videoTrack)
-					if err == nil {
-						co.Log.Log(logger.Info, "[Track-Accept] ✓ Added dummy video track to PC")
-					} else {
-						co.Log.Log(logger.Warn, "[Track-Accept] Failed to add video track: %v", err)
-					}
-				}
-			} else if i == 1 { // Audio transceiver
-				co.Log.Log(logger.Info, "[Track-Accept] Audio transceiver[1] mid=%s - will add audio track to force port != 9", mid)
-				audioTrack, err := webrtc.NewTrackLocalStaticSample(
-					webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMA, ClockRate: 8000, Channels: 1},
-					"audio",
-					"MediaMTXAudio",
-				)
-				if err == nil {
-					_, err = co.wr.AddTrack(audioTrack)
-					if err == nil {
-						co.Log.Log(logger.Info, "[Track-Accept] ✓ Added dummy audio track to PC")
-					} else {
-						co.Log.Log(logger.Warn, "[Track-Accept] Failed to add audio track: %v", err)
-					}
-				}
-			}
-		}
-	}
+	// if co.Publish {
+    //     co.Log.Log(logger.Info, "[CreateFullAnswer] Publish mode: Adding dummy tracks to force port != 9")
+        
+    //     existingTransceivers := co.wr.GetTransceivers()
+    //     for i, tr := range existingTransceivers {
+    //         if tr.Receiver() != nil && tr.Receiver().Track() == nil {
+    //             mid := tr.Mid()
+                
+    //             if i == 0 { // Video transceiver
+    //                 co.Log.Log(logger.Info, "[Track-Accept] Video transceiver[0] mid=%s - will add video track", mid)
+    //                 videoTrack, err := webrtc.NewTrackLocalStaticSample(
+    //                     webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000},
+    //                     "video",
+    //                     "MediaMTXVideo",
+    //                 )
+    //                 if err == nil {
+    //                     _, err = co.wr.AddTrack(videoTrack)
+    //                     if err == nil {
+    //                         co.Log.Log(logger.Info, "[Track-Accept] Added dummy video track to PC")
+    //                     } else {
+    //                         co.Log.Log(logger.Warn, "[Track-Accept] Failed to add video track: %v", err)
+    //                     }
+    //                 }
+    //             } else if i == 1 { // Audio transceiver
+    //                 co.Log.Log(logger.Info, "[Track-Accept] Audio transceiver[1] mid=%s - will add audio track", mid)
+    //                 audioTrack, err := webrtc.NewTrackLocalStaticSample(
+    //                     webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMA, ClockRate: 8000, Channels: 1},
+    //                     "audio",
+    //                     "MediaMTXAudio",
+    //                 )
+    //                 if err == nil {
+    //                     _, err = co.wr.AddTrack(audioTrack)
+    //                     if err == nil {
+    //                         co.Log.Log(logger.Info, "[Track-Accept] Added dummy audio track to PC")
+    //                     } else {
+    //                         co.Log.Log(logger.Warn, "[Track-Accept] Failed to add audio track: %v", err)
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    // } else {
+    //     co.Log.Log(logger.Info, "[CreateFullAnswer] Read mode: NOT adding dummy tracks (browser wants to receive only)")
+    // }
+
+	co.Log.Log(logger.Info, "[CreateFullAnswer] Transceivers auto-created by Pion from offer (codec registry)")
 	
 	// Log transceivers after SetRemoteDescription
 	transceivers := co.wr.GetTransceivers()
@@ -1581,8 +1628,8 @@ func (co *PeerConnection) CreateFullAnswer(offer *webrtc.SessionDescription) (*w
 			if receiver.Track() != nil {
 				track = receiver.Track()
 				kind = track.Kind().String()
-				co.Log.Log(logger.Info, "[Codec-Debug] Transceiver[%d] HAS TRACK: kind=%s, codec=%+v", 
-					i, kind, track.Codec())
+				// co.Log.Log(logger.Info, "[Codec-Debug] Transceiver[%d] HAS TRACK: kind=%s, codec=%+v", 
+					// i, kind, track.Codec())
 			} else {
 				co.Log.Log(logger.Warn, "[Codec-Debug] Transceiver[%d] Receiver exists but NO TRACK!", i)
 				// Try to get receiver codecs
@@ -1613,76 +1660,94 @@ func (co *PeerConnection) CreateFullAnswer(offer *webrtc.SessionDescription) (*w
 
 	// Set local description with ORIGINAL answer (Pion internal state)
 	co.Log.Log(logger.Info, "[FPT-Fix] SetLocalDescription with ORIGINAL Answer")
-	
+
 	err = co.wr.SetLocalDescription(*answer)
-	if err != nil {
-		return nil, err
-	}
+    if err != nil {
+        co.Log.Log(logger.Error, "[FPT-Fix] SetLocalDescription failed: %v", err)
+        return nil, err
+    }
 
-	// Wait for ICE gathering
-	err = co.waitGatheringDone()
-	if err != nil {
-		return nil, err
-	}
-
-	// Get final answer with all candidates
-	answer = co.wr.LocalDescription()
-
-	answer, err = co.fixConnectionAddress(answer)
-	if err != nil {
-		co.Log.Log(logger.Error, "[FPT-Fix] Failed to fix connection address: %v", err)
-	}
-
-	// Apply candidate filtering (keep TURN relay for NAT traversal)
-	answer, err = co.filterLocalDescription(answer)
-	if err != nil {
-		return nil, err
-	}
-
-	// Add FPT-specific fixes
-	answer, err = co.addIceOptionsToAnswer(answer)
-	if err != nil {
-		co.Log.Log(logger.Error, "[FPT-Fix] Failed to add ice-options: %v", err)
-		return nil, err
-	}
-
-	answer, err = co.addSSRCAttributesForFPTCamera(answer)
-	if err != nil {
-		co.Log.Log(logger.Error, "[FPT-Fix] Failed to add SSRC: %v", err)
-		return nil, err
-	}
-
-	// FIX: Replace port 9 (rejected) with port from camera's offer
-	// This ensures answer uses same port as offer, matching camera's listening port
-	answer, err = co.fixRejectedMediaPortsWithOfferPort(answer, offer)
-	if err != nil {
-		co.Log.Log(logger.Warn, "[FPT-Fix] Failed to fix rejected media ports: %v", err)
-		// Continue anyway - not critical
-	}
-
-	// Log final answer ports for verification
-	var answerSdp sdp.SessionDescription
-	answerSdp.Unmarshal([]byte(answer.SDP)) //nolint:errcheck
-	for i, media := range answerSdp.MediaDescriptions {
-		co.Log.Log(logger.Info, "[Final-Answer] Media[%d]: %s on port %d", i, media.MediaName.Media, media.MediaName.Port.Value)
-	}
-
-	// Debug: Check transceiver receivers state before returning answer
-	txceivers := co.wr.GetTransceivers()
-	co.Log.Log(logger.Info, "[Answer-Return] Total transceivers: %d", len(txceivers))
-	for i, tr := range txceivers {
-		if tr.Receiver() != nil {
-			co.Log.Log(logger.Info, "[Answer-Return] Transceiver[%d]: Receiver exists, mid=%s, direction=%s", 
-				i, tr.Mid(), tr.Direction().String())
+	for i, track := range co.OutgoingTracks {
+		var trackID string
+		if track.isVideo() {
+			trackID = fmt.Sprintf("video-%d", i)
 		} else {
-			co.Log.Log(logger.Warn, "[Answer-Return] Transceiver[%d]: NO RECEIVER, mid=%s, direction=%s", 
-				i, tr.Mid(), tr.Direction().String())
+			trackID = fmt.Sprintf("audio-%d", i)
 		}
+		
+		track.SetNegotiatedPT(co, trackID)
 	}
+	co.Log.Log(logger.Info, "[CreateFullAnswer] Negotiated PT set for %d outgoing tracks", len(co.OutgoingTracks))
 
-	co.Log.Log(logger.Info, "[FPT-Fix] CreateFullAnswer returned modified Answer")
-	
-	return answer, nil
+    // Wait for ICE gathering
+    if co.Publish {
+        err = co.waitGatheringDone()
+        if err != nil {
+            return nil, err
+        }
+    } else {
+        go co.asyncGatherCandidates()
+    }
+
+    // Get LOCAL description (with ICE candidates) SAU khi gathering
+    answer = co.wr.LocalDescription()
+    
+    if co.Publish {
+        answer, err = co.fixConnectionAddress(answer)
+        if err != nil {
+            co.Log.Log(logger.Error, "[FPT-Fix] Failed to fix connection address: %v", err)
+        }
+
+        answer, err = co.addIceOptionsToAnswer(answer)
+        if err != nil {
+            co.Log.Log(logger.Error, "[FPT-Fix] Failed to add ice-options: %v", err)
+        }
+
+        answer, err = co.addSSRCAttributesForFPTCamera(answer)
+        if err != nil {
+            co.Log.Log(logger.Error, "[FPT-Fix] Failed to add SSRC: %v", err)
+        }
+    }
+
+    answer, err = co.filterLocalDescription(answer)
+    if err != nil {
+        return nil, err
+    }
+
+    // answer, err = co.addIceOptionsToAnswer(answer)
+    // if err != nil {
+    //     co.Log.Log(logger.Error, "[FPT-Fix] Failed to add ice-options: %v", err)
+    //     return nil, err
+    // }
+
+    // answer, err = co.addSSRCAttributesForFPTCamera(answer)
+    // if err != nil {
+    //     co.Log.Log(logger.Error, "[FPT-Fix] Failed to add SSRC: %v", err)
+    //     return nil, err
+    // }
+
+    // answer, err = co.fixRejectedMediaPortsWithOfferPort(answer, offer)
+    // if err != nil {
+    //     co.Log.Log(logger.Warn, "[FPT-Fix] Failed to fix rejected media ports: %v", err)
+    // }
+
+    // answer, err = co.fixConnectionAddress(answer)
+    // if err != nil {
+    //     co.Log.Log(logger.Error, "[FPT-Fix] Failed to fix connection address: %v", err)
+    // }
+
+    // // Log final answer
+    // var answerSdp sdp.SessionDescription
+    // answerSdp.Unmarshal([]byte(answer.SDP))
+    // for i, media := range answerSdp.MediaDescriptions {
+    //     co.Log.Log(logger.Info, "[Final-Answer] Media[%d]: %s on port %d", 
+    //         i, media.MediaName.Media, media.MediaName.Port.Value)
+    // }
+
+    // co.Log.Log(logger.Info, "[FPT-Fix] CreateFullAnswer completed successfully")
+    
+    // Return modified answer (CHỈ để gửi về camera, Pion vẫn dùng original internally)
+    return answer, nil
 }
 
 func (co *PeerConnection) waitGatheringDone() error {
@@ -1770,7 +1835,7 @@ func (co *PeerConnection) GatherIncomingTracks() error {
 			return fmt.Errorf("deadline exceeded while waiting tracks")
 
 		case pair := <-co.incomingTrack:
-			co.Log.Log(logger.Info, "[Track-Gather] ✓ Received track %d/%d: %s", 
+			co.Log.Log(logger.Info, "[Track-Gather] Received track %d/%d: %s", 
 				len(co.incomingTracks)+1, maxTrackCount, pair.track.Kind().String())
 			t := &IncomingTrack{
 				track:     pair.track,
@@ -1782,7 +1847,7 @@ func (co *PeerConnection) GatherIncomingTracks() error {
 			co.incomingTracks = append(co.incomingTracks, t)
 
 			if len(co.incomingTracks) >= maxTrackCount {
-				co.Log.Log(logger.Info, "[Track-Gather] ✓ All %d tracks received successfully!", maxTrackCount)
+				co.Log.Log(logger.Info, "[Track-Gather] All %d tracks received successfully!", maxTrackCount)
 				return nil
 			}
 
@@ -2098,4 +2163,60 @@ func (co *PeerConnection) fixConnectionAddress(desc *webrtc.SessionDescription) 
 	}
 
 	return desc, nil
+}
+
+func (co *PeerConnection) asyncGatherCandidates() {
+    co.Log.Log(logger.Info, "[ICE-Async] Starting background gathering...")
+    
+    // Periodic status check every 5 seconds
+    ticker := time.NewTicker(5 * time.Second)
+    defer ticker.Stop()
+    
+    timeoutTimer := time.NewTimer(30 * time.Second)
+    defer timeoutTimer.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            // Log current state every 5s
+            state := co.wr.ICEGatheringState()
+            co.Log.Log(logger.Info, "[ICE-Async] Status: gathering=%s", state.String())
+            
+            if desc := co.wr.LocalDescription(); desc != nil {
+                candidateCount := strings.Count(desc.SDP, "a=candidate:")
+                relayCount := strings.Count(desc.SDP, "typ relay")
+                srflxCount := strings.Count(desc.SDP, "typ srflx")
+                hostCount := strings.Count(desc.SDP, "typ host")
+                co.Log.Log(logger.Info, "[ICE-Async] Progress: %d total (%d host, %d srflx, %d relay)", 
+                    candidateCount, hostCount, srflxCount, relayCount)
+            }
+            
+        case <-co.gatheringDone:
+            co.Log.Log(logger.Info, "[ICE-Async] Gathering complete!")
+            
+            if desc := co.wr.LocalDescription(); desc != nil {
+                candidateCount := strings.Count(desc.SDP, "a=candidate:")
+                relayCount := strings.Count(desc.SDP, "typ relay")
+                co.Log.Log(logger.Info, "[ICE-Async] Final: %d candidates (%d relay)", 
+                    candidateCount, relayCount)
+            }
+            return
+            
+        case <-timeoutTimer.C:
+            co.Log.Log(logger.Warn, "[ICE-Async] Gathering timeout (30s)")
+            
+            // Log final state
+            if desc := co.wr.LocalDescription(); desc != nil {
+                candidateCount := strings.Count(desc.SDP, "a=candidate:")
+                relayCount := strings.Count(desc.SDP, "typ relay")
+                co.Log.Log(logger.Warn, "[ICE-Async] Timeout with: %d candidates (%d relay)", 
+                    candidateCount, relayCount)
+            }
+            return
+            
+        case <-co.ctx.Done():
+            co.Log.Log(logger.Debug, "[ICE-Async] Cancelled")
+            return
+        }
+    }
 }
